@@ -1,18 +1,74 @@
 from __future__ import annotations
+import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from fastapi import FastAPI
 from pydantic import BaseModel
 import numpy as np
 import requests
 
-app = FastAPI(title='NSE AI Trading Agent', version='3.0.0-paper')
+app = FastAPI(title='NSE AI Trading Agent', version='4.0.0-paper')
 CAPITAL = 10_000.0
-cash = CAPITAL
-positions: dict[str, dict[str, float]] = {}
-trades: list[dict[str, Any]] = []
-last_decision: dict[str, Any] | None = None
+
+# ---------------------------------------------------------------------------
+# Persistent agent state (Vercel KV / Upstash Redis over the standard `redis`
+# client, using the KV_URL env var Vercel injects once a KV store is
+# connected to the project). Every serverless invocation is a fresh process,
+# so without this the "autonomous" agent would forget its own portfolio
+# between cron ticks. If KV_URL isn't set (or the connection fails), state
+# falls back to an in-memory default for that single invocation only —
+# the agent still runs, it just doesn't remember anything, and `persisted`
+# in every response says so honestly.
+# ---------------------------------------------------------------------------
+STATE_KEY = 'agent:state:v1'
+_kv_client = None
+_kv_attempted = False
+
+def get_kv():
+    global _kv_client, _kv_attempted
+    if _kv_attempted:
+        return _kv_client
+    _kv_attempted = True
+    url = os.environ.get('KV_URL') or os.environ.get('REDIS_URL')
+    if not url:
+        return None
+    try:
+        import redis
+        _kv_client = redis.from_url(url, socket_timeout=4, socket_connect_timeout=4, decode_responses=True)
+        _kv_client.ping()
+    except Exception:
+        _kv_client = None
+    return _kv_client
+
+def default_state():
+    return {'cash': CAPITAL, 'positions': {}, 'trades': [], 'log': [], 'last_decision': None}
+
+def load_state():
+    kv = get_kv()
+    if kv is not None:
+        try:
+            raw = kv.get(STATE_KEY)
+            if raw:
+                state = json.loads(raw)
+                for k, v in default_state().items():
+                    state.setdefault(k, v)
+                return state, True
+        except Exception:
+            pass
+    return default_state(), False
+
+def save_state(state: dict) -> bool:
+    kv = get_kv()
+    if kv is None:
+        return False
+    try:
+        kv.set(STATE_KEY, json.dumps(state))
+        return True
+    except Exception:
+        return False
 
 # ---------------------------------------------------------------------------
 # Live market data (Yahoo Finance chart API — no key required).
@@ -165,8 +221,7 @@ def scan_one(symbol: str, params: dict):
     d['as_of'] = last_ts
     return d
 
-@app.get('/api/scan')
-def scan(horizon: str = 'intraday'):
+def run_scan(horizon: str):
     horizon = horizon if horizon in HORIZONS else 'intraday'
     params = HORIZONS[horizon]
     cache_key = f'scan:{horizon}'
@@ -190,6 +245,73 @@ def scan(horizon: str = 'intraday'):
     _cache[cache_key] = (time.time(), out)
     return out
 
+@app.get('/api/scan')
+def scan(horizon: str = 'intraday'):
+    return run_scan(horizon)
+
+# ---------------------------------------------------------------------------
+# Autonomous tick. Vercel Cron hits GET /api/tick on a fixed schedule (see
+# vercel.json) — this is what makes the agent act on its own instead of only
+# reacting to button clicks. Cron only fires against the Production
+# deployment, never PR previews, and only inside NSE market hours (checked
+# here in IST, independent of whatever coarser window the cron schedule
+# itself covers).
+# ---------------------------------------------------------------------------
+IST = timezone(timedelta(hours=5, minutes=30))
+MAX_OPEN_POSITIONS = 8
+NEW_POSITION_CASH_FRACTION = 0.15
+
+def market_open(now_ist: datetime) -> bool:
+    if now_ist.weekday() >= 5:
+        return False
+    minutes = now_ist.hour * 60 + now_ist.minute
+    return 9 * 60 + 15 <= minutes <= 15 * 60 + 30
+
+@app.get('/api/tick')
+def tick():
+    now_ist = datetime.now(IST)
+    if not market_open(now_ist):
+        return {'status': 'market_closed', 'ist_time': now_ist.isoformat()}
+
+    state, _ = load_state()
+    scan_result = run_scan('intraday')
+    by_symbol = {r['symbol']: r for r in scan_result['results']}
+    executed = []
+
+    for sym in list(state['positions'].keys()):
+        d = by_symbol.get(sym)
+        if d is None:
+            prices, _, source = get_intraday_prices(sym)
+            d = decision_for(sym, prices); d['data_source'] = source
+        if d['action'] == 'EXIT':
+            p = state['positions'].pop(sym)
+            price = d['price']
+            pnl = round((price - p['avg_price']) * p['qty'], 2)
+            state['cash'] += p['qty'] * price
+            state['trades'].append({'symbol': sym, 'side': 'SELL', 'qty': p['qty'], 'price': price, 'pnl': pnl, 'ts': time.time()})
+            state['log'].append({'ts': time.time(), 'symbol': sym, 'action': 'EXIT', 'score': d['score'],
+                                  'note': f"Exited {sym} x{p['qty']} @ ₹{price} (pnl ₹{pnl})"})
+            executed.append({'symbol': sym, 'side': 'SELL', 'price': price, 'pnl': pnl})
+
+    candidates = [r for r in scan_result['results'] if r['action'] == 'BUY' and r['symbol'] not in state['positions']]
+    for d in candidates:
+        if len(state['positions']) >= MAX_OPEN_POSITIONS:
+            break
+        sym, price = d['symbol'], d['price']
+        qty = max(1, int((state['cash'] * NEW_POSITION_CASH_FRACTION) // price))
+        cost = qty * price
+        if qty > 0 and cost <= state['cash']:
+            state['cash'] -= cost
+            state['positions'][sym] = {'symbol': sym, 'qty': qty, 'avg_price': price, 'last_price': price, 'pnl': 0.0}
+            state['log'].append({'ts': time.time(), 'symbol': sym, 'action': 'BUY', 'score': d['score'],
+                                  'note': f"Bought {sym} x{qty} @ ₹{price} — {d['rationale']}"})
+            executed.append({'symbol': sym, 'side': 'BUY', 'qty': qty, 'price': price})
+
+    state['log'] = state['log'][-200:]
+    persisted = save_state(state)
+    return {'status': 'ok', 'ist_time': now_ist.isoformat(), 'executed': executed,
+            'open_positions': len(state['positions']), 'persisted': persisted}
+
 @app.get('/health')
 def health(): return {'status':'ok','mode':'paper','live_trading':False}
 
@@ -201,26 +323,42 @@ def quote(symbol: str = 'RELIANCE'):
 
 @app.get('/api/status')
 def status():
-    equity = cash + sum(p['qty']*p['last_price'] for p in positions.values())
-    return {'paper_trading':True,'live_trading':False,'cash':round(cash,2),'equity':round(equity,2),'daily_pnl':round(equity-CAPITAL,2),'trades_today':len(trades),'positions':list(positions.values()),'last_decision':last_decision,'trade_log':trades[-10:]}
+    state, persisted = load_state()
+    equity = state['cash'] + sum(p['qty'] * p['last_price'] for p in state['positions'].values())
+    return {
+        'paper_trading': True, 'live_trading': False, 'autonomous': True,
+        'persisted': persisted, 'kv_connected': get_kv() is not None,
+        'cash': round(state['cash'], 2), 'equity': round(equity, 2),
+        'daily_pnl': round(equity - CAPITAL, 2), 'trades_today': len(state['trades']),
+        'positions': list(state['positions'].values()), 'last_decision': state.get('last_decision'),
+        'trade_log': state['trades'][-10:], 'activity_log': list(reversed(state['log'][-30:])),
+    }
 
 @app.post('/api/simulate')
 def simulate(req: Request):
-    global cash, last_decision
-    symbol=req.symbol.upper().replace('.NS','')
+    state, _ = load_state()
+    symbol = req.symbol.upper().replace('.NS', '')
     prices, last_ts, source = get_intraday_prices(symbol)
-    d=decision_for(symbol,prices); d['data_source']=source; d['as_of']=last_ts
-    last_decision = d
-    price=float(prices[-1]); execution={'status':'NO_TRADE'}
-    if d['action']=='BUY' and symbol not in positions:
-        qty=max(1,int((cash*0.25)//price)); cost=qty*price
-        if qty>0 and cost<=cash:
-            cash-=cost; positions[symbol]={'symbol':symbol,'qty':qty,'avg_price':round(price,4),'last_price':round(price,4),'pnl':0.0}; execution={'status':'FILLED','side':'BUY','qty':qty,'price':round(price,4)}
-    elif symbol in positions:
-        p=positions[symbol]; p['last_price']=round(price,4); p['pnl']=round((price-p['avg_price'])*p['qty'],2)
-        if d['action']=='EXIT':
-            cash+=p['qty']*price; execution={'status':'FILLED','side':'SELL','qty':p['qty'],'price':round(price,4),'realized_pnl':p['pnl']}; trades.append({'symbol':symbol,'side':'SELL','qty':p['qty'],'price':round(price,4),'pnl':p['pnl']}); del positions[symbol]
-    return {'symbol':symbol,'price':price,'data_source':source,'candidate':d,'execution':execution}
+    d = decision_for(symbol, prices); d['data_source'] = source; d['as_of'] = last_ts
+    state['last_decision'] = d
+    price = float(prices[-1]); execution = {'status': 'NO_TRADE'}
+    if d['action'] == 'BUY' and symbol not in state['positions']:
+        qty = max(1, int((state['cash'] * 0.25) // price)); cost = qty * price
+        if qty > 0 and cost <= state['cash']:
+            state['cash'] -= cost
+            state['positions'][symbol] = {'symbol': symbol, 'qty': qty, 'avg_price': round(price, 4), 'last_price': round(price, 4), 'pnl': 0.0}
+            execution = {'status': 'FILLED', 'side': 'BUY', 'qty': qty, 'price': round(price, 4)}
+            state['log'].append({'ts': time.time(), 'symbol': symbol, 'action': 'BUY', 'score': d['score'], 'note': f"Manual buy {symbol} x{qty} @ ₹{round(price,4)}"})
+    elif symbol in state['positions']:
+        p = state['positions'][symbol]; p['last_price'] = round(price, 4); p['pnl'] = round((price - p['avg_price']) * p['qty'], 2)
+        if d['action'] == 'EXIT':
+            state['cash'] += p['qty'] * price
+            execution = {'status': 'FILLED', 'side': 'SELL', 'qty': p['qty'], 'price': round(price, 4), 'realized_pnl': p['pnl']}
+            state['trades'].append({'symbol': symbol, 'side': 'SELL', 'qty': p['qty'], 'price': round(price, 4), 'pnl': p['pnl']})
+            state['log'].append({'ts': time.time(), 'symbol': symbol, 'action': 'EXIT', 'score': d['score'], 'note': f"Manual exit {symbol} @ ₹{round(price,4)} (pnl ₹{p['pnl']})"})
+            del state['positions'][symbol]
+    persisted = save_state(state)
+    return {'symbol': symbol, 'price': price, 'data_source': source, 'candidate': d, 'execution': execution, 'persisted': persisted}
 
 @app.post('/api/backtest')
 def backtest(req: Request):
@@ -236,6 +374,5 @@ def backtest(req: Request):
 
 @app.post('/api/reset')
 def reset():
-    global cash,positions,trades,last_decision
-    cash=CAPITAL; positions={}; trades=[]; last_decision=None
-    return {'status':'reset','capital':CAPITAL}
+    persisted = save_state(default_state())
+    return {'status': 'reset', 'capital': CAPITAL, 'persisted': persisted}

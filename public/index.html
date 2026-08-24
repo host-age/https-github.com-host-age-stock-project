@@ -14,6 +14,16 @@ button.tab.active{background:#2f6fed;border-color:#2f6fed;color:#fff}
 .badge{font-family:ui-monospace,monospace;font-size:11px;padding:3px 8px;border-radius:999px;letter-spacing:.04em}
 .badge.live{background:#173829;color:#5cd68a}
 .badge.synthetic_fallback{background:#3a2a12;color:#e0a94c}
+.badge.on{background:#173829;color:#5cd68a}
+.badge.degraded{background:#3a2a12;color:#e0a94c}
+.pulse{display:inline-block;width:7px;height:7px;border-radius:50%;background:#5cd68a;margin-right:6px;animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.activity{font-family:ui-monospace,monospace;font-size:12px;line-height:1.7;max-height:260px;overflow:auto}
+.activity .row{margin:0;padding:6px 0;border-bottom:1px solid #1c2436;display:block}
+.activity .t{color:#5c6884;margin-right:8px}
+.activity .a{font-weight:700;margin-right:6px}
+.activity .a.BUY{color:#5cd68a}
+.activity .a.EXIT{color:#e07a6f}
 table{width:100%;border-collapse:collapse;font-family:ui-monospace,monospace;font-size:12.5px}
 th{text-align:left;color:#8b96ac;font-weight:600;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;padding:6px 10px;border-bottom:1px solid #24314a;position:sticky;top:0;background:#121c2d}
 td{padding:7px 10px;border-bottom:1px solid #1c2436}
@@ -31,6 +41,10 @@ tbody tr:hover{background:#182338}
 
 <h1>NSE AI Trading Agent</h1>
 <p>Paper-trading agent scanning the NIFTY 100 on live quotes (Yahoo Finance feed). <b>Live broker execution is disabled.</b></p>
+<div class="row">
+  <span id="autoBadge" class="badge degraded"><span class="pulse"></span>Checking autonomy…</span>
+  <span id="marketBadge" class="badge">—</span>
+</div>
 
 <div class="card full" style="margin-bottom:14px">
   <div class="row" style="justify-content:space-between">
@@ -62,7 +76,7 @@ tbody tr:hover{background:#182338}
   <div class="card wide"><h3>Last Decision</h3><pre id="decision" class="mono">—</pre></div>
   <div class="card wide"><h3>Positions</h3><pre id="positions" class="mono">—</pre></div>
   <div class="card wide"><h3>Execution / Backtest</h3><pre id="output" class="mono">—</pre></div>
-  <div class="card wide"><h3>Recent Trade Log</h3><pre id="log" class="mono">—</pre></div>
+  <div class="card full"><h3>Agent Activity <span style="font-weight:400;color:#5c6884;font-size:12px">— autonomous ticks + manual actions, newest first</span></h3><div id="activity" class="activity">—</div></div>
 </div>
 
 <script>
@@ -74,6 +88,12 @@ function activeSymbol(){return (custom.value.trim()||symbol.value).toUpperCase()
 async function j(u,o){return (await fetch(u,o)).json()}
 function setBadge(source){feedBadge.textContent=source==='live'?'LIVE FEED':(source?'SYNTHETIC FALLBACK':'—');feedBadge.className='badge '+(source||'')}
 
+function isMarketOpenIST(){
+  const ist = new Date(Date.now() + (5.5*3600000) + (new Date().getTimezoneOffset()*60000));
+  const day = ist.getDay(), mins = ist.getHours()*60 + ist.getMinutes();
+  return day>=1 && day<=5 && mins>=9*60+15 && mins<=15*60+30;
+}
+
 async function refresh(){
   const d=await j('/api/status');
   cash.textContent='₹'+d.cash.toFixed(2);
@@ -81,7 +101,21 @@ async function refresh(){
   pnl.textContent='₹'+d.daily_pnl.toFixed(2);
   decision.textContent=JSON.stringify(d.last_decision,null,2);
   positions.textContent=JSON.stringify(d.positions,null,2);
-  log.textContent=JSON.stringify(d.trade_log,null,2);
+
+  autoBadge.className = 'badge ' + (d.persisted ? 'on' : 'degraded');
+  autoBadge.innerHTML = '<span class="pulse"></span>' + (d.persisted
+    ? 'AUTONOMOUS · persisted via KV'
+    : (d.kv_connected ? 'AUTONOMOUS · KV read failed, using defaults' : 'AUTONOMOUS · no KV connected, resets on cold start'));
+
+  const open = isMarketOpenIST();
+  marketBadge.textContent = open ? 'NSE market open — agent ticks every 5 min' : 'NSE market closed — agent idle until 9:15am IST';
+  marketBadge.className = 'badge ' + (open ? 'on' : '');
+
+  const items = d.activity_log || [];
+  activity.innerHTML = items.length ? items.map(e=>{
+    const t = new Date(e.ts*1000).toLocaleTimeString('en-IN',{hour12:false});
+    return `<div class="row"><span class="t">${t}</span><span class="a ${e.action}">${e.action}</span>${e.note}</div>`;
+  }).join('') : '<div style="color:#5c6884">No activity yet — the agent ticks automatically every 5 minutes during market hours, or run a manual decision below.</div>';
 }
 
 async function simulate(){
@@ -132,6 +166,6 @@ function armScanTimer(){
 loadScan(false);
 armScanTimer();
 refresh();
-setInterval(refresh,5000);
+setInterval(refresh,3000);
 </script>
 </body></html>

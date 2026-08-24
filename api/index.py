@@ -1,12 +1,13 @@
 from __future__ import annotations
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from fastapi import FastAPI
 from pydantic import BaseModel
 import numpy as np
 import requests
 
-app = FastAPI(title='NSE AI Trading Agent', version='2.0.0-paper')
+app = FastAPI(title='NSE AI Trading Agent', version='3.0.0-paper')
 CAPITAL = 10_000.0
 cash = CAPITAL
 positions: dict[str, dict[str, float]] = {}
@@ -98,11 +99,14 @@ def get_history_prices(symbol: str, min_bars: int = 200):
 class Request(BaseModel):
     symbol: str = 'RELIANCE'
 
-def decision_for(symbol: str, prices: np.ndarray):
-    global last_decision
-    fast = float(np.mean(prices[-5:])); slow = float(np.mean(prices[-20:]))
-    vol = float(np.std(np.diff(np.log(prices[-20:]))))
-    momentum = float((prices[-1] / prices[-10]) - 1)
+def decision_for(symbol: str, prices: np.ndarray, fast_n: int = 5, slow_n: int = 20, mom_n: int = 10):
+    n = len(prices)
+    fast_n = max(2, min(fast_n, n))
+    slow_n = max(fast_n + 1, min(slow_n, n))
+    mom_n = max(1, min(mom_n, n - 1))
+    fast = float(np.mean(prices[-fast_n:])); slow = float(np.mean(prices[-slow_n:]))
+    vol = float(np.std(np.diff(np.log(prices[-slow_n:]))))
+    momentum = float((prices[-1] / prices[-1 - mom_n]) - 1)
     score = 0.5; reasons = []
     if fast > slow: score += 0.18; reasons.append('short-term trend above baseline')
     else: score -= 0.18; reasons.append('short-term trend below baseline')
@@ -113,11 +117,78 @@ def decision_for(symbol: str, prices: np.ndarray):
     score = float(np.clip(score, 0.05, 0.95))
     action = 'BUY' if score >= 0.62 else ('EXIT' if score <= 0.38 else 'WAIT')
     regime = 'TRENDING' if abs(momentum) > 0.015 else ('HIGH_VOLATILITY' if vol > 0.025 else 'RANGE')
-    result = {'symbol':symbol,'action':action,'score':round(score,4),'probability_success':round(score,4),
-              'expected_return':round(momentum*100,4),'downside':round(max(vol*100,0.1),4),'regime':regime,
-              'rationale':'; '.join(reasons),'scenarios':{'bull':round(float(np.clip(score+0.10,0,1)),4),'base':round(score,4),'bear':round(float(np.clip(1-score+0.10,0,1)),4)},'price':round(float(prices[-1]),4)}
-    last_decision = result
-    return result
+    return {'symbol':symbol,'action':action,'score':round(score,4),'probability_success':round(score,4),
+            'expected_return':round(momentum*100,4),'downside':round(max(vol*100,0.1),4),'regime':regime,
+            'rationale':'; '.join(reasons),'scenarios':{'bull':round(float(np.clip(score+0.10,0,1)),4),'base':round(score,4),'bear':round(float(np.clip(1-score+0.10,0,1)),4)},'price':round(float(prices[-1]),4)}
+
+# ---------------------------------------------------------------------------
+# Nifty 100 scanner. Three horizons, each with its own bar interval/lookback
+# and its own fast/slow window — an intraday scalp and a golden-cross-style
+# investing read have nothing in common except sharing decision_for's shape.
+# This is a static snapshot of Nifty 50 + Nifty Next 50 constituents (NSE's
+# official list drifts on periodic index reconstitution — this isn't pulled
+# live from NSE, so treat it as approximate).
+# ---------------------------------------------------------------------------
+NIFTY_100 = [
+    'RELIANCE','TCS','HDFCBANK','ICICIBANK','INFY','HINDUNILVR','ITC','SBIN','BHARTIARTL','BAJFINANCE',
+    'LT','KOTAKBANK','AXISBANK','ASIANPAINT','MARUTI','SUNPHARMA','TITAN','ULTRACEMCO','NESTLEIND','WIPRO',
+    'ADANIENT','ONGC','NTPC','POWERGRID','M&M','TATAMOTORS','TATASTEEL','JSWSTEEL','HCLTECH','TECHM',
+    'BAJAJFINSV','INDUSINDBK','GRASIM','DRREDDY','CIPLA','DIVISLAB','EICHERMOT','BPCL','COALINDIA','HEROMOTOCO',
+    'BRITANNIA','SHREECEM','UPL','HDFCLIFE','SBILIFE','APOLLOHOSP','TATACONSUM','ADANIPORTS','BAJAJ-AUTO','HINDALCO',
+    'DMART','PIDILITIND','GODREJCP','DABUR','HAVELLS','SIEMENS','AMBUJACEM','ICICIPRULI','ICICIGI','SBICARD',
+    'BANKBARODA','PNB','CANBK','IOC','GAIL','INDIGO','VEDL','BOSCHLTD','MARICO','COLPAL',
+    'BERGEPAINT','LUPIN','AUROPHARMA','TORNTPHARM','ALKEM','MOTHERSON','BEL','HAL','LTIM','MPHASIS',
+    'PERSISTENT','NAUKRI','ZOMATO','PAYTM','IRCTC','PAGEIND','MUTHOOTFIN','CHOLAFIN','BAJAJHLDNG','ABB',
+    'CUMMINSIND','TVSMOTOR','ASHOKLEY','ACC','JINDALSTEL','SAIL','NMDC','PIIND','INDUSTOWER','TRENT',
+]
+
+HORIZONS = {
+    'intraday': {'fast': 5, 'slow': 20, 'mom': 10, 'interval': '5m', 'range': '5d', 'ttl': 20.0, 'min_bars': 25},
+    'swing':    {'fast': 10, 'slow': 50, 'mom': 20, 'interval': '1d', 'range': '6mo', 'ttl': 300.0, 'min_bars': 55},
+    'invest':   {'fast': 50, 'slow': 200, 'mom': 60, 'interval': '1d', 'range': '2y', 'ttl': 900.0, 'min_bars': 210},
+}
+SCAN_WORKERS = 16
+SCAN_TIMEOUT_S = 25.0
+
+def scan_one(symbol: str, params: dict):
+    try:
+        prices, last_ts = fetch_yahoo(symbol, params['interval'], params['range'], params['ttl'])
+        source = 'live'
+        if len(prices) < params['min_bars']:
+            raise ValueError('not enough live bars for this horizon')
+    except Exception:
+        prices = synthetic_series(max(params['min_bars'] + 10, 300), seed=abs(hash(symbol)) % 100000)
+        last_ts = None
+        source = 'synthetic_fallback'
+    d = decision_for(symbol, prices, params['fast'], params['slow'], params['mom'])
+    d['data_source'] = source
+    d['as_of'] = last_ts
+    return d
+
+@app.get('/api/scan')
+def scan(horizon: str = 'intraday'):
+    horizon = horizon if horizon in HORIZONS else 'intraday'
+    params = HORIZONS[horizon]
+    cache_key = f'scan:{horizon}'
+    cached = _cached(cache_key, params['ttl'])
+    if cached is not None:
+        return cached
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+        futures = {pool.submit(scan_one, sym, params): sym for sym in NIFTY_100}
+        for fut in as_completed(futures, timeout=SCAN_TIMEOUT_S):
+            try:
+                results.append(fut.result())
+            except Exception:
+                continue
+    results.sort(key=lambda d: d['score'], reverse=True)
+    out = {
+        'horizon': horizon, 'universe': 'NIFTY_100', 'count': len(results),
+        'live_count': sum(1 for r in results if r['data_source'] == 'live'),
+        'generated_at': time.time(), 'results': results,
+    }
+    _cache[cache_key] = (time.time(), out)
+    return out
 
 @app.get('/health')
 def health(): return {'status':'ok','mode':'paper','live_trading':False}
@@ -135,10 +206,11 @@ def status():
 
 @app.post('/api/simulate')
 def simulate(req: Request):
-    global cash
+    global cash, last_decision
     symbol=req.symbol.upper().replace('.NS','')
     prices, last_ts, source = get_intraday_prices(symbol)
     d=decision_for(symbol,prices); d['data_source']=source; d['as_of']=last_ts
+    last_decision = d
     price=float(prices[-1]); execution={'status':'NO_TRADE'}
     if d['action']=='BUY' and symbol not in positions:
         qty=max(1,int((cash*0.25)//price)); cost=qty*price

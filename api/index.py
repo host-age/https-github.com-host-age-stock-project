@@ -2,7 +2,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from fastapi import FastAPI
@@ -206,6 +206,26 @@ HORIZONS = {
 SCAN_WORKERS = 16
 SCAN_TIMEOUT_S = 25.0
 
+def run_pool(fn, items, *args):
+    """Run fn(item, *args) across items in a thread pool, returning whatever
+    completes within SCAN_TIMEOUT_S. A slow straggler degrades the result to
+    partial coverage instead of losing every already-finished result to an
+    uncaught as_completed() timeout."""
+    results = []
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+        futures = {pool.submit(fn, item, *args): item for item in items}
+        try:
+            for fut in as_completed(futures, timeout=SCAN_TIMEOUT_S):
+                try:
+                    r = fut.result()
+                    if r is not None:
+                        results.append(r)
+                except Exception:
+                    continue
+        except FuturesTimeoutError:
+            pass
+    return results
+
 def scan_one(symbol: str, params: dict):
     try:
         prices, last_ts = fetch_yahoo(symbol, params['interval'], params['range'], params['ttl'])
@@ -228,14 +248,7 @@ def run_scan(horizon: str):
     cached = _cached(cache_key, params['ttl'])
     if cached is not None:
         return cached
-    results: list[dict] = []
-    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
-        futures = {pool.submit(scan_one, sym, params): sym for sym in NIFTY_100}
-        for fut in as_completed(futures, timeout=SCAN_TIMEOUT_S):
-            try:
-                results.append(fut.result())
-            except Exception:
-                continue
+    results = run_pool(scan_one, NIFTY_100, params)
     results.sort(key=lambda d: d['score'], reverse=True)
     out = {
         'horizon': horizon, 'universe': 'NIFTY_100', 'count': len(results),
@@ -248,6 +261,89 @@ def run_scan(horizon: str):
 @app.get('/api/scan')
 def scan(horizon: str = 'intraday'):
     return run_scan(horizon)
+
+# ---------------------------------------------------------------------------
+# Portfolio-wide backtest: does this strategy actually beat just holding the
+# index? Walk-forward over ~2y of daily closes for every NIFTY 100 symbol
+# (decision_for at bar i only ever sees prices[:i+1] — no lookahead), each
+# compared against its own buy-and-hold return, plus the NIFTY 50 index
+# (^NSEI — the closest liquid, reliably-available benchmark; NIFTY 100 has
+# no equally reliable free index ticker) as the market-level bar to clear.
+# cost_bps defaults to 0 (frictionless) — pass e.g. ?cost_bps=10 for a
+# realistic ~0.10%-per-leg NSE cost estimate; a frictionless number is not
+# what real trading would return, it's only a first check for any edge at
+# all before costs are even considered.
+# ---------------------------------------------------------------------------
+BENCHMARK_SYMBOL = 'NIFTY'
+PORTFOLIO_BACKTEST_TTL = 900.0
+
+def backtest_symbol(symbol: str, params: dict, cost_bps: float):
+    prices, _, source = get_history_prices(symbol)
+    n = len(prices)
+    cost_frac = cost_bps / 10000.0
+    equity = CAPITAL; peak = equity; max_dd = 0.0; in_pos = False; entry = 0.0; trades_count = 0
+    start_i = max(25, params['slow'] + 1)
+    for i in range(min(start_i, n), n):
+        d = decision_for(symbol, prices[:i + 1], params['fast'], params['slow'], params['mom'])
+        px = float(prices[i])
+        if d['action'] == 'BUY' and not in_pos:
+            entry = px * (1 + cost_frac); in_pos = True; trades_count += 1
+        elif d['action'] == 'EXIT' and in_pos:
+            equity *= (px * (1 - cost_frac)) / entry
+            in_pos = False; trades_count += 1
+        peak = max(peak, equity); max_dd = max(max_dd, (peak - equity) / peak * 100)
+    if in_pos:
+        equity *= (float(prices[-1]) * (1 - cost_frac)) / entry
+    strategy_return_pct = (equity / CAPITAL - 1) * 100
+    buyhold_return_pct = (float(prices[-1]) / float(prices[0]) - 1) * 100
+    return {
+        'symbol': symbol, 'bars': n, 'trades': trades_count,
+        'strategy_return_pct': round(strategy_return_pct, 2),
+        'buyhold_return_pct': round(buyhold_return_pct, 2),
+        'max_drawdown_pct': round(max_dd, 2),
+        'beat_buyhold': strategy_return_pct > buyhold_return_pct,
+        'data_source': source,
+    }
+
+@app.get('/api/backtest_portfolio')
+def backtest_portfolio(horizon: str = 'swing', cost_bps: float = 0.0):
+    horizon = horizon if horizon in ('swing', 'invest') else 'swing'
+    params = HORIZONS[horizon]
+    cache_key = f'btport:{horizon}:{cost_bps}'
+    cached = _cached(cache_key, PORTFOLIO_BACKTEST_TTL)
+    if cached is not None:
+        return cached
+
+    results = run_pool(backtest_symbol, NIFTY_100, params, cost_bps)
+
+    if not results:
+        return {'horizon': horizon, 'universe': 'NIFTY_100', 'count': 0, 'results': []}
+
+    bench_prices, _, bench_source = get_history_prices(BENCHMARK_SYMBOL, min_bars=50)
+    benchmark_return_pct = round((float(bench_prices[-1]) / float(bench_prices[0]) - 1) * 100, 2)
+
+    strat_returns = sorted(r['strategy_return_pct'] for r in results)
+    bh_returns = [r['buyhold_return_pct'] for r in results]
+    results.sort(key=lambda r: r['strategy_return_pct'], reverse=True)
+
+    out = {
+        'horizon': horizon, 'universe': 'NIFTY_100', 'count': len(results),
+        'live_count': sum(1 for r in results if r['data_source'] == 'live'),
+        'cost_bps_per_leg': cost_bps, 'frictionless': cost_bps == 0.0,
+        'summary': {
+            'avg_strategy_return_pct': round(sum(strat_returns) / len(strat_returns), 2),
+            'median_strategy_return_pct': round(strat_returns[len(strat_returns) // 2], 2),
+            'avg_buyhold_return_pct': round(sum(bh_returns) / len(bh_returns), 2),
+            'win_rate_vs_buyhold_pct': round(sum(1 for r in results if r['beat_buyhold']) / len(results) * 100, 2),
+            'benchmark_symbol': 'NIFTY 50 (^NSEI)', 'benchmark_return_pct': benchmark_return_pct,
+            'benchmark_source': bench_source,
+            'avg_trades_per_symbol': round(sum(r['trades'] for r in results) / len(results), 1),
+            'avg_max_drawdown_pct': round(sum(r['max_drawdown_pct'] for r in results) / len(results), 2),
+        },
+        'results': results, 'generated_at': time.time(),
+    }
+    _cache[cache_key] = (time.time(), out)
+    return out
 
 # ---------------------------------------------------------------------------
 # Autonomous tick. Vercel Cron hits GET /api/tick on a fixed schedule (see

@@ -35,6 +35,12 @@ tbody tr:hover{background:#182338}
 .act.EXIT{background:#3a1f1f;color:#e07a6f}
 .act.WAIT{background:#20293c;color:#8b96ac}
 .right{text-align:right}
+.pos{color:#5cd68a}
+.neg{color:#e07a6f}
+.stat{background:#0f1726;border:1px solid #24314a;border-radius:10px;padding:10px 14px}
+.stat .l{font-size:10px;color:#8b96ac;text-transform:uppercase;letter-spacing:.06em}
+.stat .v{font-family:ui-monospace,monospace;font-size:19px;font-weight:700;margin-top:3px}
+.statgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:12px 0}
 @media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.wide{grid-column:span 2}}
 @media(max-width:600px){.grid{grid-template-columns:1fr}.wide{grid-column:span 1}}
 </style></head><body>
@@ -77,6 +83,25 @@ tbody tr:hover{background:#182338}
   <div class="card wide"><h3>Positions</h3><pre id="positions" class="mono">—</pre></div>
   <div class="card wide"><h3>Execution / Backtest</h3><pre id="output" class="mono">—</pre></div>
   <div class="card full"><h3>Agent Activity <span style="font-weight:400;color:#5c6884;font-size:12px">— autonomous ticks + manual actions, newest first</span></h3><div id="activity" class="activity">—</div></div>
+
+  <div class="card full">
+    <div class="row" style="justify-content:space-between">
+      <h3 style="margin:0">Strategy vs Buy &amp; Hold <span style="font-weight:400;color:#5c6884;font-size:12px">— walk-forward backtest across the NIFTY 100, does the signal actually beat holding?</span></h3>
+      <div class="row">
+        <select id="btHorizon"><option value="swing">Swing (6mo, daily)</option><option value="invest">Invest (2y, daily)</option></select>
+        <label style="font-size:12px;color:#9fb0cc;display:flex;align-items:center;gap:6px"><input type="checkbox" id="btCosts" style="width:auto;padding:0"> include ~0.10%/leg costs</label>
+        <button onclick="runPortfolioBacktest()">Run backtest</button>
+      </div>
+    </div>
+    <div id="btStatus" style="color:#5c6884;font-size:13px;margin-bottom:6px">Not run yet.</div>
+    <div id="btSummary" class="statgrid" style="display:none"></div>
+    <div class="scantable" id="btTableWrap" style="display:none">
+      <table>
+        <thead><tr><th>Symbol</th><th class="right">Strategy</th><th class="right">Buy &amp; Hold</th><th>Beat B&amp;H</th><th class="right">Trades</th><th class="right">Max DD</th></tr></thead>
+        <tbody id="btBody"></tbody>
+      </table>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -146,6 +171,40 @@ async function loadScan(force){
   scanBody.innerHTML = rows || '<tr><td colspan="7" style="color:#5c6884">No data.</td></tr>';
   scanMeta.textContent = `${r.live_count}/${r.count} live · ${horizon}`;
   scanMeta.className = 'badge ' + (r.live_count>0 ? 'live' : 'synthetic_fallback');
+}
+
+async function runPortfolioBacktest(){
+  const horizon = btHorizon.value;
+  const costBps = btCosts.checked ? 10 : 0;
+  btStatus.textContent = `Running walk-forward backtest across NIFTY 100 (${horizon}, ${costBps===0?'frictionless':'~0.10%/leg costs'})… this fetches ~2y of history per symbol, can take several seconds.`;
+  btSummary.style.display = 'none';
+  btTableWrap.style.display = 'none';
+  const r = await j(`/api/backtest_portfolio?horizon=${horizon}&cost_bps=${costBps}`);
+  if(!r.count){ btStatus.textContent = 'No results — try again.'; return; }
+  const s = r.summary;
+  const pnCls = v => v>=0 ? 'pos' : 'neg';
+  btStatus.innerHTML = `${r.count} symbols · ${r.live_count}/${r.count} on live data · ` +
+    (r.frictionless ? '<b>frictionless</b> (no transaction costs)' : `costs: ${r.cost_bps_per_leg} bps/leg`) +
+    ` · cache refreshes every 15 min`;
+  btSummary.style.display = 'grid';
+  btSummary.innerHTML = `
+    <div class="stat"><div class="l">Avg strategy return</div><div class="v ${pnCls(s.avg_strategy_return_pct)}">${s.avg_strategy_return_pct}%</div></div>
+    <div class="stat"><div class="l">Avg buy &amp; hold</div><div class="v ${pnCls(s.avg_buyhold_return_pct)}">${s.avg_buyhold_return_pct}%</div></div>
+    <div class="stat"><div class="l">${s.benchmark_symbol}</div><div class="v ${pnCls(s.benchmark_return_pct)}">${s.benchmark_return_pct}%</div></div>
+    <div class="stat"><div class="l">Win rate vs B&amp;H</div><div class="v">${s.win_rate_vs_buyhold_pct}%</div></div>
+    <div class="stat"><div class="l">Avg trades / symbol</div><div class="v">${s.avg_trades_per_symbol}</div></div>
+    <div class="stat"><div class="l">Avg max drawdown</div><div class="v neg">${s.avg_max_drawdown_pct}%</div></div>
+  `;
+  btTableWrap.style.display = 'block';
+  btBody.innerHTML = r.results.map(row => `
+    <tr>
+      <td>${row.symbol}</td>
+      <td class="right ${pnCls(row.strategy_return_pct)}">${row.strategy_return_pct}%</td>
+      <td class="right ${pnCls(row.buyhold_return_pct)}">${row.buyhold_return_pct}%</td>
+      <td>${row.beat_buyhold ? '<span class="act BUY">YES</span>' : '<span class="act EXIT">NO</span>'}</td>
+      <td class="right">${row.trades}</td>
+      <td class="right">${row.max_drawdown_pct}%</td>
+    </tr>`).join('');
 }
 
 document.getElementById('tabs').addEventListener('click', e=>{

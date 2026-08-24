@@ -1,9 +1,7 @@
 from __future__ import annotations
 import time
 from typing import Any
-from pathlib import Path
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import numpy as np
 import requests
@@ -120,10 +118,6 @@ def decision_for(symbol: str, prices: np.ndarray):
               'rationale':'; '.join(reasons),'scenarios':{'bull':round(float(np.clip(score+0.10,0,1)),4),'base':round(score,4),'bear':round(float(np.clip(1-score+0.10,0,1)),4)},'price':round(float(prices[-1]),4)}
     last_decision = result
     return result
-
-@app.get('/')
-def root():
-    return FileResponse(Path(__file__).resolve().parents[1] / 'public' / 'index.html')
 
 @app.get('/health')
 def health(): return {'status':'ok','mode':'paper','live_trading':False}

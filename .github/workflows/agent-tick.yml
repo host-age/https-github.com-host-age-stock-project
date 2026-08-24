@@ -1,0 +1,34 @@
+name: Autonomous agent tick
+
+# Vercel's Hobby plan caps Cron Jobs to once per day (vercel.json's cron is
+# kept as a once-daily fallback), so the actual high-frequency autonomous
+# ticking runs here instead, for free, via GitHub Actions' own scheduler.
+#
+# One-time setup: Settings -> Secrets and variables -> Actions -> Variables
+# -> add TICK_URL = your deployed production URL, e.g.
+# https://https-github-com-host-age-stock-project.vercel.app
+# (find the exact domain under your Vercel project's Domains tab). Until
+# TICK_URL is set, this workflow no-ops with a message instead of failing.
+#
+# Note: GitHub disables scheduled workflows automatically after 60 days
+# with no commits to the repo, and schedule timing isn't second-precise
+# under GitHub's own load — treat "every 15 min" as approximate.
+
+on:
+  schedule:
+    - cron: '*/15 3-10 * * 1-5'
+  workflow_dispatch: {}
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /api/tick
+        env:
+          TICK_URL: ${{ vars.TICK_URL }}
+        run: |
+          if [ -z "$TICK_URL" ]; then
+            echo "TICK_URL repository variable is not set — skipping. Add it under Settings > Secrets and variables > Actions > Variables."
+            exit 0
+          fi
+          curl -sS --max-time 25 "$TICK_URL/api/tick"

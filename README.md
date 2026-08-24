@@ -9,9 +9,15 @@ Prices come from the public Yahoo Finance chart API (no API key needed). NSE tic
 `/api/scan?horizon=intraday|swing|invest` scans a static snapshot of the NIFTY 100 constituents (defined in `api/index.py`; NSE's official list drifts on periodic reconstitution, so treat this as approximate) and ranks them by signal score. Each horizon uses its own bar interval and fast/slow window — intraday (5m bars, 5/20-bar crossover), swing (daily bars over 6mo, 10/50-bar), invest (daily bars over 2y, 50/200-bar golden-cross style). Symbols are fetched in parallel and the scan result is cached per-horizon.
 
 ## Autonomous agent
-`GET /api/tick` runs one full decision cycle — scan, exit anything that's turned bearish, buy top BUY-rated candidates up to 8 open positions — without any user interaction. It's wired to **Vercel Cron** in `vercel.json` (`*/5 3-10 * * 1-5`, every 5 minutes during NSE market hours in UTC, refined further inside the handler using precise IST market-hours logic). Two things worth knowing:
-- **Cron only fires against your Production deployment**, never PR previews — the agent won't tick on a preview URL until this merges to your default branch.
-- **Vercel's cron frequency limits vary by plan.** If you're on the Hobby tier, check your dashboard's Cron Jobs settings — Vercel may cap or reject sub-daily schedules depending on current plan limits.
+`GET /api/tick` runs one full decision cycle — scan, exit anything that's turned bearish, buy top BUY-rated candidates up to 8 open positions — without any user interaction. Two schedulers drive it, because Vercel's Hobby plan caps Cron Jobs to once per day:
+
+- **Vercel Cron** (`vercel.json`, `50 3 * * 1-5` — once daily at market open, weekdays) is the reliable baseline. Free on any plan, but only ticks once a day on Hobby.
+- **GitHub Actions** (`.github/workflows/agent-tick.yml`, every 15 minutes during market hours) is what actually gives the agent a live, autonomous feel without needing Vercel Pro. One-time setup: add a repository variable `TICK_URL` = your Vercel production URL (Settings → Secrets and variables → Actions → Variables; find the exact domain under your Vercel project's Domains tab). Until it's set, the workflow no-ops with a message instead of failing. GitHub disables scheduled workflows after 60 days with no commits to the repo, and schedule timing isn't second-precise under GitHub's own load.
+- If you're on **Vercel Pro**, you can drop the GitHub Actions workflow and just tighten `vercel.json`'s cron schedule instead (e.g. `*/5 3-10 * * 1-5`) — Pro doesn't have the daily cap.
+
+Both routes hit the same `/api/tick` endpoint, so it's safe to have both active at once.
+
+**Cron/Actions only fire against your deployed Production URL, never PR previews** — the agent won't tick on this PR's preview link until it merges to your default branch.
 
 ### Persistent state (Vercel KV)
 Without persistent storage, the agent's cash/positions/trade log live only in the serverless function's memory and vanish between invocations — including between cron ticks, which defeats the point of running autonomously. To fix this:

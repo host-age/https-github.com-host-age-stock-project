@@ -1,3 +1,7 @@
-fastapi==0.116.1
-pydantic==2.11.7
-numpy==2.3.2
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+flask>=3.0
+gunicorn>=21.0
+kiteconnect>=4.2
+pytest>=7.0

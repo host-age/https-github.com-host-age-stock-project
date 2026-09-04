@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+runs/
+*.log
+kite_token.json
+kite_instruments.json
+.DS_Store
+*.egg-info/
+.venv/
+venv/

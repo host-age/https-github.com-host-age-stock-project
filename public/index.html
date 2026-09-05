@@ -1,1 +1,230 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NSE AI Trading Agent</title><style>body{font-family:Inter,Arial,sans-serif;background:#0b1220;color:#e9eef7;margin:0;padding:24px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.card{background:#121c2d;border:1px solid #24314a;border-radius:14px;padding:16px}.wide{grid-column:span 2}.value{font-size:28px;font-weight:700}.mono{font-family:ui-monospace,monospace;white-space:pre-wrap;word-break:break-word}button,input{padding:10px 12px;border-radius:8px;border:1px solid #34445e;background:#0f1726;color:#e9eef7}button{cursor:pointer;background:#2f6fed;border:0}.row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.wide{grid-column:span 2}}@media(max-width:600px){.grid{grid-template-columns:1fr}.wide{grid-column:span 1}}</style></head><body><h1>NSE AI Trading Agent</h1><p>Working paper-trading model. <b>Live broker execution is disabled.</b></p><div class="row"><input id="symbol" value="DEMO"><button onclick="simulate()">Run decision</button><button onclick="backtest()">Run backtest</button><button onclick="resetAgent()">Reset</button></div><div class="grid"><div class="card"><div>Mode</div><div class="value">PAPER</div></div><div class="card"><div>Cash</div><div id="cash" class="value">—</div></div><div class="card"><div>Equity</div><div id="equity" class="value">—</div></div><div class="card"><div>Daily P&amp;L</div><div id="pnl" class="value">—</div></div><div class="card wide"><h3>Last Decision</h3><pre id="decision" class="mono">—</pre></div><div class="card wide"><h3>Positions</h3><pre id="positions" class="mono">—</pre></div><div class="card wide"><h3>Execution / Backtest</h3><pre id="output" class="mono">—</pre></div><div class="card wide"><h3>Recent Trade Log</h3><pre id="log" class="mono">—</pre></div></div><script>async function j(u,o){return (await fetch(u,o)).json()}async function refresh(){const d=await j('/api/status');cash.textContent='₹'+d.cash.toFixed(2);equity.textContent='₹'+d.equity.toFixed(2);pnl.textContent='₹'+d.daily_pnl.toFixed(2);decision.textContent=JSON.stringify(d.last_decision,null,2);positions.textContent=JSON.stringify(d.positions,null,2);log.textContent=JSON.stringify(d.trade_log,null,2)}async function simulate(){output.textContent=JSON.stringify(await j('/api/simulate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:symbol.value,bars:350,seed:17})}),null,2);refresh()}async function backtest(){output.textContent=JSON.stringify(await j('/api/backtest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:symbol.value,bars:1200,seed:31})}),null,2);refresh()}async function resetAgent(){output.textContent=JSON.stringify(await j('/api/reset',{method:'POST'}),null,2);refresh()}refresh();setInterval(refresh,5000)</script></body></html>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NSE AI Trading Agent</title><style>
+body{font-family:Inter,Arial,sans-serif;background:#0b1220;color:#e9eef7;margin:0;padding:24px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.card{background:#121c2d;border:1px solid #24314a;border-radius:14px;padding:16px}
+.wide{grid-column:span 2}
+.full{grid-column:1/-1}
+.value{font-size:28px;font-weight:700}
+.mono{font-family:ui-monospace,monospace;white-space:pre-wrap;word-break:break-word}
+button,input,select{padding:10px 12px;border-radius:8px;border:1px solid #34445e;background:#0f1726;color:#e9eef7}
+button{cursor:pointer;background:#2f6fed;border:0}
+button.tab{background:#0f1726;border:1px solid #34445e;color:#9fb0cc}
+button.tab.active{background:#2f6fed;border-color:#2f6fed;color:#fff}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0;align-items:center}
+.badge{font-family:ui-monospace,monospace;font-size:11px;padding:3px 8px;border-radius:999px;letter-spacing:.04em}
+.badge.live{background:#173829;color:#5cd68a}
+.badge.synthetic_fallback{background:#3a2a12;color:#e0a94c}
+.badge.on{background:#173829;color:#5cd68a}
+.badge.degraded{background:#3a2a12;color:#e0a94c}
+.pulse{display:inline-block;width:7px;height:7px;border-radius:50%;background:#5cd68a;margin-right:6px;animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.activity{font-family:ui-monospace,monospace;font-size:12px;line-height:1.7;max-height:260px;overflow:auto}
+.activity .row{margin:0;padding:6px 0;border-bottom:1px solid #1c2436;display:block}
+.activity .t{color:#5c6884;margin-right:8px}
+.activity .a{font-weight:700;margin-right:6px}
+.activity .a.BUY{color:#5cd68a}
+.activity .a.EXIT{color:#e07a6f}
+table{width:100%;border-collapse:collapse;font-family:ui-monospace,monospace;font-size:12.5px}
+th{text-align:left;color:#8b96ac;font-weight:600;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;padding:6px 10px;border-bottom:1px solid #24314a;position:sticky;top:0;background:#121c2d}
+td{padding:7px 10px;border-bottom:1px solid #1c2436}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:#182338}
+.scantable{max-height:420px;overflow:auto;border-radius:10px}
+.act{font-size:10.5px;padding:2px 8px;border-radius:5px;font-weight:700;letter-spacing:.04em}
+.act.BUY{background:#173829;color:#5cd68a}
+.act.EXIT{background:#3a1f1f;color:#e07a6f}
+.act.WAIT{background:#20293c;color:#8b96ac}
+.right{text-align:right}
+.pos{color:#5cd68a}
+.neg{color:#e07a6f}
+.stat{background:#0f1726;border:1px solid #24314a;border-radius:10px;padding:10px 14px}
+.stat .l{font-size:10px;color:#8b96ac;text-transform:uppercase;letter-spacing:.06em}
+.stat .v{font-family:ui-monospace,monospace;font-size:19px;font-weight:700;margin-top:3px}
+.statgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:12px 0}
+@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.wide{grid-column:span 2}}
+@media(max-width:600px){.grid{grid-template-columns:1fr}.wide{grid-column:span 1}}
+</style></head><body>
+
+<h1>NSE AI Trading Agent</h1>
+<p>Paper-trading agent scanning the NIFTY 100 on live quotes (Yahoo Finance feed). <b>Live broker execution is disabled.</b></p>
+<div class="row">
+  <span id="autoBadge" class="badge degraded"><span class="pulse"></span>Checking autonomy…</span>
+  <span id="marketBadge" class="badge">—</span>
+</div>
+
+<div class="card full" style="margin-bottom:14px">
+  <div class="row" style="justify-content:space-between">
+    <div class="row" id="tabs">
+      <button class="tab active" data-h="intraday">Intraday</button>
+      <button class="tab" data-h="swing">Swing</button>
+      <button class="tab" data-h="invest">Invest</button>
+    </div>
+    <div class="row">
+      <span id="scanMeta" class="badge">—</span>
+      <button onclick="loadScan(true)">Rescan</button>
+    </div>
+  </div>
+  <div class="scantable">
+    <table>
+      <thead><tr><th>#</th><th>Symbol</th><th class="right">Price</th><th>Action</th><th class="right">Score</th><th>Regime</th><th>Feed</th></tr></thead>
+      <tbody id="scanBody"><tr><td colspan="7" style="color:#5c6884">Loading NIFTY 100 scan…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="row"><select id="symbol"><option value="RELIANCE">RELIANCE</option><option value="TCS">TCS</option><option value="INFY">INFY</option><option value="HDFCBANK">HDFCBANK</option><option value="ICICIBANK">ICICIBANK</option><option value="SBIN">SBIN</option><option value="NIFTY">NIFTY 50</option><option value="BANKNIFTY">BANK NIFTY</option></select><input id="custom" placeholder="or type a ticker, e.g. TATASTEEL" style="width:200px"><button onclick="simulate()">Run decision</button><button onclick="backtest()">Run backtest</button><button onclick="resetAgent()">Reset</button><span id="feedBadge" class="badge">—</span></div>
+
+<div class="grid">
+  <div class="card"><div>Mode</div><div class="value">PAPER</div></div>
+  <div class="card"><div>Cash</div><div id="cash" class="value">—</div></div>
+  <div class="card"><div>Equity</div><div id="equity" class="value">—</div></div>
+  <div class="card"><div>Daily P&amp;L</div><div id="pnl" class="value">—</div></div>
+  <div class="card wide"><h3>Last Decision</h3><pre id="decision" class="mono">—</pre></div>
+  <div class="card wide"><h3>Positions</h3><pre id="positions" class="mono">—</pre></div>
+  <div class="card wide"><h3>Execution / Backtest</h3><pre id="output" class="mono">—</pre></div>
+  <div class="card full"><h3>Agent Activity <span style="font-weight:400;color:#5c6884;font-size:12px">— autonomous ticks + manual actions, newest first</span></h3><div id="activity" class="activity">—</div></div>
+
+  <div class="card full">
+    <div class="row" style="justify-content:space-between">
+      <h3 style="margin:0">Strategy vs Buy &amp; Hold <span style="font-weight:400;color:#5c6884;font-size:12px">— walk-forward backtest across the NIFTY 100, does the signal actually beat holding?</span></h3>
+      <div class="row">
+        <select id="btHorizon"><option value="swing">Swing (6mo, daily)</option><option value="invest">Invest (2y, daily)</option></select>
+        <label style="font-size:12px;color:#9fb0cc;display:flex;align-items:center;gap:6px"><input type="checkbox" id="btCosts" style="width:auto;padding:0"> include ~0.10%/leg costs</label>
+        <button onclick="runPortfolioBacktest()">Run backtest</button>
+      </div>
+    </div>
+    <div id="btStatus" style="color:#5c6884;font-size:13px;margin-bottom:6px">Not run yet.</div>
+    <div id="btSummary" class="statgrid" style="display:none"></div>
+    <div class="scantable" id="btTableWrap" style="display:none">
+      <table>
+        <thead><tr><th>Symbol</th><th class="right">Strategy</th><th class="right">Buy &amp; Hold</th><th>Beat B&amp;H</th><th class="right">Trades</th><th class="right">Max DD</th></tr></thead>
+        <tbody id="btBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+let horizon = 'intraday';
+const REFRESH_MS = {intraday:20000, swing:120000, invest:300000};
+let scanTimer = null;
+
+function activeSymbol(){return (custom.value.trim()||symbol.value).toUpperCase()}
+async function j(u,o){return (await fetch(u,o)).json()}
+function setBadge(source){feedBadge.textContent=source==='live'?'LIVE FEED':(source?'SYNTHETIC FALLBACK':'—');feedBadge.className='badge '+(source||'')}
+
+function isMarketOpenIST(){
+  const ist = new Date(Date.now() + (5.5*3600000) + (new Date().getTimezoneOffset()*60000));
+  const day = ist.getDay(), mins = ist.getHours()*60 + ist.getMinutes();
+  return day>=1 && day<=5 && mins>=9*60+15 && mins<=15*60+30;
+}
+
+async function refresh(){
+  const d=await j('/api/status');
+  cash.textContent='₹'+d.cash.toFixed(2);
+  equity.textContent='₹'+d.equity.toFixed(2);
+  pnl.textContent='₹'+d.daily_pnl.toFixed(2);
+  decision.textContent=JSON.stringify(d.last_decision,null,2);
+  positions.textContent=JSON.stringify(d.positions,null,2);
+
+  autoBadge.className = 'badge ' + (d.persisted ? 'on' : 'degraded');
+  autoBadge.innerHTML = '<span class="pulse"></span>' + (d.persisted
+    ? 'AUTONOMOUS · persisted via KV'
+    : (d.kv_connected ? 'AUTONOMOUS · KV read failed, using defaults' : 'AUTONOMOUS · no KV connected, resets on cold start'));
+
+  const open = isMarketOpenIST();
+  marketBadge.textContent = open ? 'NSE market open — agent ticks every 5 min' : 'NSE market closed — agent idle until 9:15am IST';
+  marketBadge.className = 'badge ' + (open ? 'on' : '');
+
+  const items = d.activity_log || [];
+  activity.innerHTML = items.length ? items.map(e=>{
+    const t = new Date(e.ts*1000).toLocaleTimeString('en-IN',{hour12:false});
+    return `<div class="row"><span class="t">${t}</span><span class="a ${e.action}">${e.action}</span>${e.note}</div>`;
+  }).join('') : '<div style="color:#5c6884">No activity yet — the agent ticks automatically every 5 minutes during market hours, or run a manual decision below.</div>';
+}
+
+async function simulate(){
+  const r=await j('/api/simulate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:activeSymbol()})});
+  output.textContent=JSON.stringify(r,null,2); setBadge(r.data_source); refresh();
+}
+async function backtest(){
+  const r=await j('/api/backtest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:activeSymbol()})});
+  output.textContent=JSON.stringify(r,null,2); setBadge(r.data_source); refresh();
+}
+async function resetAgent(){
+  output.textContent=JSON.stringify(await j('/api/reset',{method:'POST'}),null,2); refresh();
+}
+
+async function loadScan(force){
+  scanMeta.textContent='Scanning…';
+  const r = await j('/api/scan?horizon='+horizon+(force?'&_='+Date.now():''));
+  const rows = r.results.map((d,i)=>`
+    <tr onclick="custom.value='${d.symbol}'">
+      <td>${i+1}</td>
+      <td>${d.symbol}</td>
+      <td class="right">₹${d.price}</td>
+      <td><span class="act ${d.action}">${d.action}</span></td>
+      <td class="right">${d.score}</td>
+      <td>${d.regime}</td>
+      <td><span class="badge ${d.data_source}" style="padding:1px 6px">${d.data_source==='live'?'LIVE':'SYN'}</span></td>
+    </tr>`).join('');
+  scanBody.innerHTML = rows || '<tr><td colspan="7" style="color:#5c6884">No data.</td></tr>';
+  scanMeta.textContent = `${r.live_count}/${r.count} live · ${horizon}`;
+  scanMeta.className = 'badge ' + (r.live_count>0 ? 'live' : 'synthetic_fallback');
+}
+
+async function runPortfolioBacktest(){
+  const horizon = btHorizon.value;
+  const costBps = btCosts.checked ? 10 : 0;
+  btStatus.textContent = `Running walk-forward backtest across NIFTY 100 (${horizon}, ${costBps===0?'frictionless':'~0.10%/leg costs'})… this fetches ~2y of history per symbol, can take several seconds.`;
+  btSummary.style.display = 'none';
+  btTableWrap.style.display = 'none';
+  const r = await j(`/api/backtest_portfolio?horizon=${horizon}&cost_bps=${costBps}`);
+  if(!r.count){ btStatus.textContent = 'No results — try again.'; return; }
+  const s = r.summary;
+  const pnCls = v => v>=0 ? 'pos' : 'neg';
+  btStatus.innerHTML = `${r.count} symbols · ${r.live_count}/${r.count} on live data · ` +
+    (r.frictionless ? '<b>frictionless</b> (no transaction costs)' : `costs: ${r.cost_bps_per_leg} bps/leg`) +
+    ` · cache refreshes every 15 min`;
+  btSummary.style.display = 'grid';
+  btSummary.innerHTML = `
+    <div class="stat"><div class="l">Avg strategy return</div><div class="v ${pnCls(s.avg_strategy_return_pct)}">${s.avg_strategy_return_pct}%</div></div>
+    <div class="stat"><div class="l">Avg buy &amp; hold</div><div class="v ${pnCls(s.avg_buyhold_return_pct)}">${s.avg_buyhold_return_pct}%</div></div>
+    <div class="stat"><div class="l">${s.benchmark_symbol}</div><div class="v ${pnCls(s.benchmark_return_pct)}">${s.benchmark_return_pct}%</div></div>
+    <div class="stat"><div class="l">Win rate vs B&amp;H</div><div class="v">${s.win_rate_vs_buyhold_pct}%</div></div>
+    <div class="stat"><div class="l">Avg trades / symbol</div><div class="v">${s.avg_trades_per_symbol}</div></div>
+    <div class="stat"><div class="l">Avg max drawdown</div><div class="v neg">${s.avg_max_drawdown_pct}%</div></div>
+  `;
+  btTableWrap.style.display = 'block';
+  btBody.innerHTML = r.results.map(row => `
+    <tr>
+      <td>${row.symbol}</td>
+      <td class="right ${pnCls(row.strategy_return_pct)}">${row.strategy_return_pct}%</td>
+      <td class="right ${pnCls(row.buyhold_return_pct)}">${row.buyhold_return_pct}%</td>
+      <td>${row.beat_buyhold ? '<span class="act BUY">YES</span>' : '<span class="act EXIT">NO</span>'}</td>
+      <td class="right">${row.trades}</td>
+      <td class="right">${row.max_drawdown_pct}%</td>
+    </tr>`).join('');
+}
+
+document.getElementById('tabs').addEventListener('click', e=>{
+  const btn = e.target.closest('button.tab');
+  if(!btn) return;
+  document.querySelectorAll('#tabs .tab').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  horizon = btn.dataset.h;
+  loadScan(false);
+  armScanTimer();
+});
+
+function armScanTimer(){
+  if(scanTimer) clearInterval(scanTimer);
+  scanTimer = setInterval(()=>loadScan(false), REFRESH_MS[horizon]);
+}
+
+loadScan(false);
+armScanTimer();
+refresh();
+setInterval(refresh,3000);
+</script>
+</body></html>

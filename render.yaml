@@ -1,0 +1,30 @@
+# Render blueprint for the NSE Grandmaster paper trader.
+# Deploy: push this repo to GitHub, then in Render choose "New +" -> "Blueprint"
+# and point it at the repo. Render reads this file and creates the service.
+#
+# Real prices in, paper money out -- no real orders are ever placed.
+services:
+  - type: web
+    name: nse-paper-trader
+    runtime: python
+    plan: starter            # 512MB is enough; the heavy work runs elsewhere
+    region: singapore        # closest Render region to NSE for low feed latency
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m gmq.app.server"
+    healthCheckPath: /health
+    autoDeploy: false
+    envVars:
+      - key: KITE_API_KEY
+        sync: false          # set in the Render dashboard (secret)
+      - key: KITE_ACCESS_TOKEN
+        sync: false          # today's token; refresh daily via /set-token
+      - key: KITE_USER_ID
+        sync: false
+      - key: ADMIN_SECRET
+        generateValue: true  # Render generates a secret for /set-token
+      - key: SYMBOLS
+        value: "RELIANCE,TCS,HDFCBANK,INFY,ICICIBANK,SBIN,BHARTIARTL,ITC,LT,AXISBANK"
+      - key: START_CAPITAL
+        value: "1000000"
+      - key: PYTHONUNBUFFERED
+        value: "1"

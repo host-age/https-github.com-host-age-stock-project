@@ -1,14 +1,25 @@
-# NSE AI Trading Agent — Vercel Dashboard
+# Grandmaster Engine
 
-This repository is prepared for Vercel as a **paper-trading dashboard** driven by live NSE market data. Live broker execution is disabled — every fill is simulated against a ₹10,000 paper book.
+This repository holds two related but independent NSE trading systems:
 
-## Market data
+- **`api/`** — a lightweight **Vercel-hosted paper-trading dashboard** driven by live NSE market data. Good for a quick web view of a simple moving-average strategy running against real quotes.
+- **`gmq/`** — the **Grandmaster Engine**, a terminal-run, chess-engine-style trading system with a simulated exchange, ML-based forecasting, a hard risk layer, and full backtest/walk-forward/stress tooling. Run it with `python -m gmq ...` (see below).
+
+They share this repo but do not share code or state — pick the one that matches what you're trying to do.
+
+---
+
+## `api/` — Vercel paper-trading dashboard
+
+This part of the repository is prepared for Vercel as a **paper-trading dashboard** driven by live NSE market data. Live broker execution is disabled — every fill is simulated against a ₹10,000 paper book.
+
+### Market data
 Prices come from the public Yahoo Finance chart API (no API key needed). NSE tickers are looked up as `SYMBOL.NS` (e.g. `RELIANCE` → `RELIANCE.NS`); a few indices have friendly aliases (`NIFTY`, `BANKNIFTY`, `SENSEX`). If the live feed is unreachable or rate-limited, the app falls back to a synthetic price path and reports `data_source: "synthetic_fallback"` in the API response and a badge on the dashboard, so it never fails silently.
 
-## NIFTY 100 scanner
+### NIFTY 100 scanner
 `/api/scan?horizon=intraday|swing|invest` scans a static snapshot of the NIFTY 100 constituents (defined in `api/index.py`; NSE's official list drifts on periodic reconstitution, so treat this as approximate) and ranks them by signal score. Each horizon uses its own bar interval and fast/slow window — intraday (5m bars, 5/20-bar crossover), swing (daily bars over 6mo, 10/50-bar), invest (daily bars over 2y, 50/200-bar golden-cross style). Symbols are fetched in parallel and the scan result is cached per-horizon.
 
-## Autonomous agent
+### Autonomous agent
 `GET /api/tick` runs one full decision cycle — scan, exit anything that's turned bearish, buy top BUY-rated candidates up to 8 open positions — without any user interaction. Two schedulers drive it, because Vercel's Hobby plan caps Cron Jobs to once per day:
 
 - **Vercel Cron** (`vercel.json`, `50 3 * * 1-5` — once daily at market open, weekdays) is the reliable baseline. Free on any plan, but only ticks once a day on Hobby.
@@ -19,7 +30,7 @@ Both routes hit the same `/api/tick` endpoint, so it's safe to have both active 
 
 **Cron/Actions only fire against your deployed Production URL, never PR previews** — the agent won't tick on this PR's preview link until it merges to your default branch.
 
-### Persistent state (Vercel KV)
+#### Persistent state (Vercel KV)
 Without persistent storage, the agent's cash/positions/trade log live only in the serverless function's memory and vanish between invocations — including between cron ticks, which defeats the point of running autonomously. To fix this:
 1. In your Vercel project dashboard: **Storage → Create Database → KV**, then connect it to this project (Production + Preview environments).
 2. Vercel automatically injects a `KV_URL` env var into the function's runtime — no code changes needed, `api/index.py` picks it up via the standard `redis` client.
@@ -27,12 +38,12 @@ Without persistent storage, the agent's cash/positions/trade log live only in th
 
 Without KV connected, the agent still runs (`autonomous: true`) but is amnesiac — every tick and every manual action operates on a fresh in-memory default rather than a coherent portfolio.
 
-## Does the strategy actually make money?
+### Does the strategy actually make money?
 `/api/backtest_portfolio?horizon=swing|invest&cost_bps=0` answers this empirically instead of assuming it: walk-forward over ~2 years of daily closes for every NIFTY 100 symbol (`decision_for` at bar *i* only ever sees `prices[:i+1]` — no lookahead), each compared against its own buy-and-hold return over the same window, plus the NIFTY 50 index (`^NSEI`) as the market-level bar to clear. The dashboard's "Strategy vs Buy & Hold" panel runs this and shows average/median strategy return, average buy-and-hold return, win rate against buy-and-hold, and the index return, plus a per-symbol breakdown.
 
 **`cost_bps` defaults to 0 — frictionless.** That's a first check for whether the rule has any edge at all before transaction costs are even considered; it is *not* what real trading would return. Pass `cost_bps=10` (or check "include costs" on the dashboard) for a rough ~0.10%-per-leg NSE cost estimate (brokerage + STT + slippage, ~0.20% round trip) — a frictionless-positive, cost-adjusted-negative result means the edge, if any, doesn't survive real trading costs. Results are cached 15 minutes per horizon/cost combination.
 
-## Endpoints
+### Endpoints
 - `/` dashboard
 - `/health` health check
 - `/api/quote?symbol=RELIANCE` latest live price
@@ -44,11 +55,279 @@ Without KV connected, the agent still runs (`autonomous: true`) but is amnesiac 
 - `/api/backtest` — `{"symbol": "RELIANCE"}` (single-symbol backtest over ~2y of daily closes)
 - `/api/reset`
 
-## Limitations
+### Limitations
 - Position sizing in `/api/tick` is a flat 15% of cash per new position, capped at 8 open positions — a placeholder, not real risk management (no stop-losses, no volatility-scaled sizing, no portfolio-level exposure caps yet).
 - The NIFTY 100 list is fundamentals-free — no P/E, earnings, debt ratios, F&O open interest, or news sentiment. The `invest` horizon is a price-trend read (50/200-bar crossover), not a genuine fundamentals-based investing signal.
 - `/api/backtest_portfolio`'s cost model is a flat bps-per-leg approximation, not real order-book slippage, and the strategy's own thresholds (0.62/0.38 score cutoffs, window sizes) were picked by hand, not walk-forward-optimized or validated out-of-sample — a strong in-sample result here is a reason to test further, not a guarantee of live performance.
 - Yahoo's chart API is unofficial and undocumented; treat quotes as near-real-time, not exchange-certified.
 
-## Architecture boundary
-Vercel hosts the dashboard/API. The future always-on market-data, ML, risk and broker-execution engine should run separately; broker credentials must remain server-side secrets.
+### Architecture boundary
+Vercel hosts the dashboard/API. The `gmq/` engine below is the future always-on market-data, ML, risk and broker-execution system, and runs separately; broker credentials must remain server-side secrets.
+
+---
+
+## `gmq/` — the Grandmaster Engine
+
+A real-time, data-driven trading system for NSE equities, built around a
+chess-engine-style decision architecture: it generates candidate moves,
+simulates the market's replies, evaluates the resulting positions, and plays
+the move with the best risk-adjusted expected value — then keeps re-evaluating
+while the position is open.
+
+It ships with a **simulated NSE** to run against, because the alternative was
+shipping an untested live-order path.
+
+### Read this first
+
+This system trades a **simulated market**. That simulation is good — prices
+emerge from a real price-time-priority matching engine driven by market
+makers, informed traders and noise traders, and it reproduces realistic
+spreads (~1–2bp), daily volatility (1.5–2.2%) and cross-sectional correlation
+(~0.48 at one-minute sampling). But it is still a model.
+
+**A simulator validates the code, not the edge.** Everything measured here
+demonstrates that the machinery works and is internally honest. None of it is
+evidence that the strategy would make money in a real market, and the live
+broker path is deliberately left unimplemented behind a three-part lock
+(`gmq/execution/kite.py`).
+
+Sections 12 (latency) and 11 (execution) of the specification are implemented
+against the simulator's timings. Those constants would all need re-measuring
+against a real venue before they mean anything.
+
+### Architecture
+
+The eleven blocks from the specification, each a real module:
+
+```
+Market Data ─┬─ SimExchange        real matching engine, emergent prices
+             ├─ MarketDataEngine   L2 book, 7 timeframes, breadth, sectors
+             └─ ReplayFeed         historical OHLCV with Brownian-bridge paths
+        ↓
+Features ────┬─ technical.py       ~30 normalised indicators × 7 timeframes
+             ├─ microstructure.py  OFI, VPIN, Kyle's λ, queue, sweep cost
+             ├─ crosssectional.py  live correlation matrix, beta, breadth
+             └─ derivatives.py     Black-Scholes, IV surface, PCR, max pain, GEX
+        ↓
+Regime ─────── detector.py         filtered HMM over 8 regimes, interpretable
+        ↓
+Models ──────┬─ base.py            triple-barrier labelling (leak-safe)
+             ├─ online.py          AdaGrad logistic / ridge / quantile
+             ├─ gbdt.py            periodically-refit trees, purged + embargoed
+             └─ ensemble.py        isotonic calibration, skill-weighted blend
+        ↓
+Strategy ────┬─ moves.py           the 9 legal actions, parameterised
+             ├─ scenarios.py       block-bootstrapped, antithetic paths
+             ├─ evaluator.py       Indian cost model + objective function
+             └─ search.py          expectimax, beam, iterative deepening
+        ↓
+Risk ────────┬─ engine.py          THE HARD LAYER — no override exists
+             ├─ sizing.py          risk budget / vol target / Kelly / liquidity
+             ├─ stops.py           dynamic placement + monotonic ratchet
+             └─ portfolio.py       correlation clusters, VaR/ES, exposures
+        ↓
+Execution ───┬─ simbroker.py       latency, rejects, partials, stop triggers
+             ├─ router.py          slicing, retries, reconciliation
+             └─ kite.py            live adapter, locked
+        ↓
+Monitor ─────┬─ trade_monitor.py   7-way adverse-move diagnosis
+             └─ journal.py         append-only JSONL + queryable SQLite
+        ↓
+Analytics ─── metrics.py           Sharpe/Sortino/Calmar, MAE-MFE, per-regime
+Backtest ──── backtest/engine.py   walk-forward, Monte Carlo, stress, overfit
+```
+
+### What was measured
+
+All figures from the simulated market, reported honestly.
+
+#### The market itself
+
+| Property | Measured | Real NSE large-caps |
+|---|---|---|
+| Bid-ask spread | 0.9 – 2.2 bp | ~1 – 3 bp |
+| Daily volatility | 1.5 – 2.2% | ~1.2 – 2% |
+| 1-min cross-correlation | 0.48 | ~0.4 – 0.6 |
+| Tick-level noise | 1 – 4.5 bp | comparable |
+
+#### Model forecast skill
+
+Measured **out-of-sample on non-overlapping windows** — each sample scored
+before the model trains on it, and samples spaced a full horizon apart so
+label windows never overlap:
+
+| Horizon | n | Brier | Brier skill | Accuracy |
+|---|---|---|---|---|
+| 60s | 6496 | 0.226 | **+0.096** | 62.3% |
+| 300s | 1277 | 0.193 | **+0.226** | 71.0% |
+| 900s | 401 | 0.201 | **+0.191** | 73.8% |
+| 3600s | 100 | 0.212 | **+0.129** | 72.0% |
+
+Positive Brier skill means the model beats predicting the base rate. The
+overlapping-window figure is roughly twice as flattering and is reported
+separately, labelled as inflated, because it is.
+
+#### Regime detection
+
+35 – 46% accurate against ground truth versus 12.5% for chance, with 79–84%
+precision on its strongest class. Honestly: this is the weakest component.
+Regime is used as a feature and a gate, and its confidence is exposed so
+downstream logic can discount it.
+
+#### Latency
+
+Search: 7.7ms mean / 22.8ms p99 in the full engine against a 25ms budget.
+
+#### The strategy itself
+
+A clean 3-session run, 8 symbols, ₹10,00,000, no halts:
+
+| | |
+|---|---|
+| Trades | 185 (41.6% won) |
+| Return | **−0.045%** after all costs |
+| Expectancy | −₹2.44 / trade, −0.001R |
+| Profit factor | 0.80 |
+| Max drawdown | 0.10% |
+| Position mismatches | 1 |
+| Stops placed / triggered | 763 / 8 |
+
+**It loses a small amount after costs.** That is the honest read: the machinery
+works end to end and is internally consistent — all seven leakage checks pass,
+every R-multiple is measurable, reconciliation is clean — but the search is not
+finding an edge that survives Indian transaction costs at this trade frequency.
+
+Two things stand out as the places to look, and neither is a bug:
+
+- **Median holding period is 15 seconds.** The engine is scalping, not running
+  the multi-timeframe theses the architecture is built for. The decision
+  cadence and the exit side of the objective are letting it churn.
+- **61% of losing trades were meaningfully in profit first** (`excursions.
+  losers_that_were_winners`). The exit policy gives back winners. That is a
+  target/trail calibration problem, and the MAE/MFE block exists precisely to
+  make it visible.
+
+The walk-forward, Monte Carlo and stress tooling is there to test whether any
+change to those actually helps or is just another curve fit.
+
+### Bugs this build found and fixed
+
+Kept here because each one is a failure mode that is *silent* — the system
+keeps running and looks fine.
+
+1. **The objective never traded.** `EV − 1.25·σ` demands a per-trade Sharpe
+   above 1.25 before any trade clears. Variance needs the Arrow-Pratt form
+   (`γ·Var/2·equity`), not a raw standard deviation.
+2. **Costs charged twice** — once into the simulated position's fees, again in
+   the objective — halving every entry's score.
+3. **Confidence multiplied in the edge magnitude**, so a well-evidenced small
+   edge scored as "unconfident" and every entry gate failed.
+4. **Equity double-counted the cash** paid for a position, understating equity
+   by the whole book and firing every percentage risk limit far too early.
+5. **A search timeout discarded better shallow results**, so the answer quietly
+   got worse under load — exactly when it matters most.
+6. **The regime filter self-trapped**: without a prior floor, one state reached
+   0.999 and no contrary evidence could ever climb back.
+7. **Volatility measured over a 65-minute window** while regimes last ~25,
+   averaging across two or three different regimes.
+8. **The order-rate circuit breaker was a flat 30/min** regardless of universe
+   size, counted child slices and stop-management traffic rather than
+   decisions, and used a one-minute window that cannot tell a correlated
+   stop-out burst from a runaway loop. It halted the engine for working.
+9. **Stops were computed but never placed.** Every position was sized against
+   its stop distance and the risk engine was told about it — and no order
+   existed. A stop that lives only in a variable is not a stop. There is now a
+   resting SL-M order at the broker *and* a local per-tick check, because a
+   broker-held stop can be rejected or lost on a reconnect.
+10. **`initial_risk` was recomputed on every fill.** After two partial exits it
+    reflected the residual share count while realised P&L still reflected the
+    whole trade, so R-multiples exploded — one run reported **+₹1.67
+    expectancy and −0.72R simultaneously**. 1R is now fixed at entry.
+11. **The multi-day clock never advanced to the next session.** It ran past
+    15:30 into the night, so the move generator correctly refused to open new
+    intraday risk "minutes before the close" — forever. A three-day run was
+    silently a one-day run.
+12. **The consecutive-loss halt measured nothing.** At a 50% win rate a run of
+    five appears somewhere in sixty trades ~83% of the time, so it fired daily
+    on chance alone. The threshold now scales with the observed win rate and
+    the day's trade count.
+13. **Cancelled orders were decremented from the expected position twice**,
+    once in `cancel()` and again in the terminal-order callback. With a stop
+    resting on every position — cancelled and replaced on every ratchet — that
+    produced 211 phantom position mismatches in one run. A reconciliation
+    alarm nobody believes is not an alarm.
+14. **Fill rate counted untriggered stops as misses**, dragging the metric to
+    ~52% and hiding whether there was a genuine execution problem underneath.
+    A protective stop that never fires is a success.
+15. **`Order` is a dataclass with a generated `__eq__`**, so partitioning
+    order history with `o not in working` compared by *value*: twenty
+    identical stop orders tested equal and collapsed to one. Combined with a
+    triggered stop being rewritten to `MARKET` by the broker, the report said
+    "0 stops triggered" for a run in which every stop worked.
+
+Several of these only became visible *because* an earlier fix exposed them —
+the R-multiple explosion was hidden behind a sizing bug, and the reconciliation
+double-count could not appear until stops were actually being placed.
+
+### The rules that have no override
+
+```python
+# gmq/risk/engine.py — holds no reference to the model or strategy layer,
+# and exposes no method that relaxes a limit.
+```
+
+* An entry **without a stop** is refused outright — unbounded loss has no
+  acceptable size.
+* A stop **only ever moves toward price.** There is no code path that widens
+  one; `StopPolicy.update` asserts monotonicity before returning.
+* A halt **never blocks an exit** — a control that traps the book in a position
+  it cannot leave has become the risk.
+* Correlated same-direction positions count as **one** exposure.
+* The risk engine halts on its own for daily loss, drawdown, consecutive
+  losses, loss velocity, model degradation, order-rate anomaly, reject rate,
+  slippage and VaR breach — without needing anything upstream to agree.
+
+`tests/test_risk.py::test_risk_engine_has_no_override_api` fails if anyone
+adds `force=`, `override()` or a settable-limit path the strategy can reach.
+
+### Running it
+
+```bash
+pip install numpy pandas scikit-learn pytest
+
+python -m gmq run --days 3 --dashboard     # a session + HTML report
+python -m gmq backtest --days 2 --seeds 5  # multi-seed + deflated Sharpe
+python -m gmq walkforward --folds 4        # rolling out-of-sample
+python -m gmq stress                       # crash, illiquidity, gappy news
+python -m gmq verify                       # 58 tests
+```
+
+Useful knobs live in `gmq/core/config.py`. Set `search.node_budget > 0` for
+bit-reproducible research runs — a wall-clock budget makes two folds
+incomparable because a faster machine explores more of the tree.
+
+### Going live
+
+Don't, yet. If you do:
+
+1. `GMQ_ALLOW_LIVE_TRADING=1`, `GMQ_LIVE_CONFIRM=I-UNDERSTAND-THIS-TRADES-REAL-MONEY`,
+   and `acknowledged=True` at the call site. All three, none of them defaults.
+2. Implement the three marked methods in `gmq/execution/kite.py`.
+3. **Re-measure everything.** Latency, fill probability, impact and slippage
+   are calibrated to this simulator and none of those numbers transfer.
+4. Run in observation mode against live data first, comparing predicted to
+   realised fills, until the cost model is grounded in reality.
+5. Check SEBI and exchange rules on automated order flow from retail accounts
+   with your broker. That question is not answered by this code compiling.
+
+Start with capital you are fully prepared to lose, keep the hard limits tight,
+and watch it. A system's first live session is an experiment, not a deployment.
+
+See `DEPLOY.md` for deploying the always-on/live pieces, `OPERATIONS.md` for
+day-to-day operation, and `SELF_EVOLUTION.md` for the strategy self-evolution
+loop.
+
+---
+
+*This is engineering work, not financial advice. Autonomous trading systems
+lose money quickly and comprehensively when their assumptions break.*

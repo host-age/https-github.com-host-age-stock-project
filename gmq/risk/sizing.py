@@ -17,16 +17,20 @@ candidate sizes are computed and the smallest wins:
      and shrinks further when the model's demonstrated skill is weak.
   4. **Liquidity.** Never take more than a modest share of visible depth; the
      impact cost of unwinding it otherwise exceeds any edge.
+
+The economic layer makes the Kelly calculation explicit: first establish the
+break-even win probability from the payoff/cost structure, then calculate raw
+Kelly, then shrink it by confidence/skill and apply the hard cap.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict
 
 from ..core.types import Prediction
 from ..core.config import RiskLimits
-from ..core.mathx import clamp, kelly_fraction, safe_div
+from ..core.mathx import clamp, safe_div
+from ..economics import break_even_probability, kelly_fraction
 
 
 @dataclass
@@ -74,15 +78,24 @@ class PositionSizer:
         else:
             cands["vol_target"] = cands["risk"]
 
-        # 3 -- fractional Kelly on the barrier probabilities
+        # 3 -- economic / fractional Kelly on barrier probabilities.
         p_t, p_s = pred.p_target, pred.p_stop
         if p_t + p_s > 1e-6:
             p_win = p_t / (p_t + p_s)
         else:
             p_win = clamp(pred.p_up, 0.01, 0.99)
-        # payoff ratio implied by where the target and stop actually sit
+
+        # The current barrier construction targets roughly 1.6R. Keep this
+        # explicit rather than hiding the payoff assumption in a magic number.
         win_r = 1.6
-        f = kelly_fraction(p_win, win_r, 1.0)
+        loss_r = 1.0
+        p_be = break_even_probability(win_r, loss_r)
+        if p_win <= p_be:
+            f = 0.0
+        else:
+            # Raw Kelly first; confidence/skill are applied separately below.
+            f = kelly_fraction(p_win, win_r, loss_r, confidence=1.0, cap=1.0)
+
         # Shrink toward zero by how much skill the model has actually shown.
         # Kelly on an unvalidated probability is not aggressive, it is reckless.
         shrink = clamp(0.25 + 0.75 * clamp(model_skill * 3.0, 0.0, 1.0), 0.0, 1.0)

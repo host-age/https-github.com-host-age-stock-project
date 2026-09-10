@@ -1,30 +1,24 @@
-"""Feature assembly (spec §16, block 2) and multi-timeframe alignment (§4).
+"""Feature assembly and time-aware stock knowledge.
 
-Two jobs:
-
-1. Assemble the full feature vector for one symbol at one instant from the
-   bar, microstructure, cross-sectional, derivatives and calendar blocks --
-   with a stable ordering.
-
-2. Align timeframes. The short-horizon agent must not take a position that
-   fights materially stronger higher-timeframe structure unless the strategy
-   explicitly allows it.
-
-The quantitative-math block added here converts basic mathematical ideas into
-actual model inputs: robust statistics, first/second derivatives, OLS trend
-quality, and VWAP distance. These are features, not standalone signals.
+The feature engine combines technical/microstructure data with the persistent
+knowledge layer. Past observations, present market state and known future events
+are converted into bounded model inputs; the hot tick path only updates O(1)
+state, while knowledge is checkpointed from the minute boundary.
 """
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from ..core.types import Timeframe, Tick
-from ..core.mathx import clamp, safe_div
+from ..core.mathx import clamp
+from ..core.config import sector_of
 from ..quant_math import descriptive_stats, log_returns, linear_regression, rate_of_change, acceleration
+from ..knowledge import KnowledgeStore, PreTradeKnowledge
 from .technical import timeframe_features, atr, realised_vol
 from .microstructure import MicrostructureEngine
 from .crosssectional import CrossSectionalEngine
@@ -48,6 +42,9 @@ class FeatureVector:
     atr_pct: float = 0.0
     price: float = 0.0
     liquidity: float = 0.5
+    knowledge_score: float = 0.5
+    knowledge_event_risk: float = 0.0
+    knowledge_win_rate: float = 0.5
     ready: bool = False
 
     def vec(self, names: List[str]) -> np.ndarray:
@@ -57,7 +54,8 @@ class FeatureVector:
 
 class FeatureEngine:
     def __init__(self, symbols: List[str], index_symbol: str = "NIFTY",
-                 timeframes: Optional[List[Timeframe]] = None):
+                 timeframes: Optional[List[Timeframe]] = None,
+                 knowledge_path: Optional[str] = None):
         self.symbols = list(symbols)
         self.timeframes = timeframes or [
             Timeframe.M1, Timeframe.M5, Timeframe.M15,
@@ -70,6 +68,16 @@ class FeatureEngine:
         self._name_set: set = set()
         self.session_features_on = True
         self._cache: Dict[str, FeatureVector] = {}
+
+        # Past/present/future knowledge. Persistence is only touched from the
+        # minute boundary, never from the per-tick hot path.
+        self.knowledge_path = knowledge_path or os.environ.get(
+            "GMQ_KNOWLEDGE_PATH", "runs/stock_knowledge.json")
+        self.knowledge = KnowledgeStore(self.knowledge_path)
+        self.pretrade = PreTradeKnowledge(self.knowledge)
+        self._knowledge_minutes = 0
+        for s in self.symbols:
+            self.knowledge.register(s, sector=sector_of(s), instrument_type="EQ")
 
     def feature_names(self) -> List[str]:
         return self._names or []
@@ -85,13 +93,6 @@ class FeatureEngine:
                 self._name_set |= new
 
     def _quant_math_features(self, ser) -> Dict[str, float]:
-        """Build bounded quantitative features from closed 1-minute data.
-
-        These are deliberately diagnostic/model features rather than hard
-        trading rules. A robust median/MAD view helps around jumps; first and
-        second derivatives capture velocity/acceleration of price movement;
-        OLS slope + R² distinguish magnitude from trend quality.
-        """
         vals: Dict[str, float] = {}
         if ser is None or ser.n < 10:
             return vals
@@ -103,18 +104,50 @@ class FeatureEngine:
             vals["qtm_ret_std"] = clamp(ds["std"] * 1e4, 0.0, 100.0)
             vals["qtm_ret_mad"] = clamp(ds["mad"] * 1e4, 0.0, 100.0)
             vals["qtm_ret_iqr"] = clamp(ds["iqr"] * 1e4, 0.0, 100.0)
-            vals["qtm_ret_robust_z"] = clamp((rets[-1] - ds["median"]) / max(1.4826 * ds["mad"], 1e-9), -8.0, 8.0)
+            vals["qtm_ret_robust_z"] = clamp(
+                (rets[-1] - ds["median"]) / max(1.4826 * ds["mad"], 1e-9), -8.0, 8.0)
         if closes.size >= 3:
-            vals["qtm_price_velocity"] = clamp(rate_of_change(float(closes[-1]), float(closes[-2]), 60.0) / max(float(closes[-1]), 1e-9) * 1e4, -100.0, 100.0)
-            vals["qtm_price_acceleration"] = clamp(acceleration(float(closes[-1]), float(closes[-2]), float(closes[-3]), 60.0) / max(float(closes[-1]), 1e-9) * 1e6, -100.0, 100.0)
+            vals["qtm_price_velocity"] = clamp(
+                rate_of_change(float(closes[-1]), float(closes[-2]), 60.0)
+                / max(float(closes[-1]), 1e-9) * 1e4, -100.0, 100.0)
+            vals["qtm_price_acceleration"] = clamp(
+                acceleration(float(closes[-1]), float(closes[-2]), float(closes[-3]), 60.0)
+                / max(float(closes[-1]), 1e-9) * 1e6, -100.0, 100.0)
         if closes.size >= 20:
             window = closes[-60:] if closes.size >= 60 else closes
             x = np.arange(window.size, dtype=np.float64)
-            slope, intercept, r2, resid = linear_regression(x, np.log(np.maximum(window, 1e-9)))
+            slope, intercept, r2, resid = linear_regression(
+                x, np.log(np.maximum(window, 1e-9)))
             vals["qtm_ols_slope"] = clamp(slope * 1e4, -100.0, 100.0)
             vals["qtm_ols_r2"] = clamp(r2, 0.0, 1.0)
             vals["qtm_ols_resid"] = clamp(resid * 1e4, 0.0, 100.0)
         return vals
+
+    def _knowledge_features(self, symbol: str, ts: int, px: float,
+                            spread_bps: float, liquidity: float) -> Dict[str, float]:
+        k = self.knowledge.snapshot(symbol, ts)
+        hist = self.knowledge.historical_win_rate(symbol)
+        obs_quality = clamp(k.observed_ticks / 500.0, 0.0, 1.0)
+        event_risk = clamp(k.event_risk, 0.0, 1.0)
+        spread_quality = 1.0 - clamp(spread_bps / 40.0, 0.0, 1.0)
+        knowledge_score = clamp(
+            0.35 * obs_quality
+            + 0.25 * hist
+            + 0.20 * liquidity
+            + 0.20 * spread_quality
+            - 0.30 * event_risk,
+            0.0, 1.0)
+        return {
+            "kn_observations": obs_quality,
+            "kn_hist_win_rate": hist,
+            "kn_event_risk": event_risk,
+            "kn_spread_quality": spread_quality,
+            "kn_knowledge_score": knowledge_score,
+            "kn_hist_return_mean": clamp(k.return_mean * 1e4, -50.0, 50.0),
+            "kn_hist_return_std": clamp(k.return_std * 1e4, 0.0, 100.0),
+            "kn_hist_trend_slope": clamp(k.trend_slope * 1e4, -100.0, 100.0),
+            "kn_hist_trend_r2": clamp(k.trend_r2, 0.0, 1.0),
+        }
 
     def build(self, symbol: str, ts: int, mde, calendar: Optional[dict] = None
               ) -> FeatureVector:
@@ -160,9 +193,14 @@ class FeatureEngine:
                                          mde.day_change_pct(symbol)))
         vals["dv_rv_ann"] = clamp(rv_ann, 0, 3)
 
-        # Quantitative-math block. Uses closed 1m observations, so it does not
-        # add O(tick) work to the fast market-data path.
         vals.update(self._quant_math_features(mde.series(symbol, Timeframe.M1)))
+        kn = self._knowledge_features(symbol, ts, px,
+                                      getattr(mde.last_tick.get(symbol), "spread_bps", 0.0),
+                                      fv.liquidity)
+        vals.update(kn)
+        fv.knowledge_score = kn["kn_knowledge_score"]
+        fv.knowledge_event_risk = kn["kn_event_risk"]
+        fv.knowledge_win_rate = kn["kn_hist_win_rate"]
 
         if calendar:
             vals.update({f"cal_{k}": float(v) for k, v in calendar.items()})
@@ -190,17 +228,43 @@ class FeatureEngine:
         if px <= 0:
             return fv
         ms = self.micro.get(symbol)
+        tick = mde.last_tick.get(symbol)
+        spread_bps = getattr(tick, "spread_bps", 0.0)
+        kn = self._knowledge_features(symbol, ts, px, spread_bps, ms.liquidity_score())
         out = FeatureVector(
             symbol=symbol, ts=ts, values=dict(fv.values),
             alignment=fv.alignment, alignment_conflict=fv.alignment_conflict,
             dominant_tf=fv.dominant_tf, atr=fv.atr,
             atr_pct=fv.atr / px if px > 0 else fv.atr_pct,
-            price=px, liquidity=ms.liquidity_score(), ready=fv.ready)
+            price=px, liquidity=ms.liquidity_score(),
+            knowledge_score=kn["kn_knowledge_score"],
+            knowledge_event_risk=kn["kn_event_risk"],
+            knowledge_win_rate=kn["kn_hist_win_rate"],
+            ready=fv.ready)
         out.values.update(ms.features(px))
+        out.values.update(kn)
         out.values["mx_liquidity"] = out.liquidity
         out.values["ctx_day_change"] = clamp(mde.day_change_pct(symbol), -12, 12)
         out.values["ctx_stale"] = 1.0 if mde.is_stale(symbol) else 0.0
         return out
+
+    def evaluate_pretrade(self, symbol: str, now_ns: int, *, direction: int,
+                          confidence: float, expected_edge_bps: float,
+                          stop: float = 0.0, current_price: float = 0.0) :
+        """Public pre-trade knowledge evaluation for the decision/execution layer."""
+        tick = None
+        spread_bps = 0.0
+        liquidity = 0.5
+        # Feature cache gives us the most recent known microstructure state.
+        cached = self._cache.get(symbol)
+        if cached is not None:
+            spread_bps = cached.values.get("mx_spread_bps", 0.0)
+            liquidity = cached.liquidity
+        return self.pretrade.evaluate(
+            symbol, now_ns, direction=direction, confidence=confidence,
+            expected_edge_bps=expected_edge_bps,
+            current_spread_bps=spread_bps, liquidity=liquidity,
+            data_fresh=True)
 
     @staticmethod
     def _tf_direction(blk: Dict[str, float], tfv: str) -> float:
@@ -241,12 +305,30 @@ class FeatureEngine:
 
     def on_tick(self, t: Tick) -> None:
         self.micro.on_tick(t)
+        self.knowledge.observe(
+            t.symbol, t.ts, t.ltp, volume=t.volume,
+            spread_bps=t.spread_bps, liquidity=self.micro.get(t.symbol).liquidity_score())
 
     def on_depth(self, d) -> None:
         self.micro.on_depth(d)
 
     def on_minute(self, prices: Dict[str, float]) -> None:
         self.cross.on_bar_close(prices)
+        self._knowledge_minutes += 1
+        # Persistence is deliberately amortised outside the tick path.
+        if self._knowledge_minutes % 5 == 0:
+            self.knowledge.prune_expired_events(max((t.last_ts_ns for t in self.knowledge._stocks.values()), default=0))
+            self.knowledge.checkpoint(self.knowledge_path)
+
+    def add_future_event(self, symbol: str, ts_ns: int, kind: str,
+                         severity: float = 0.5, source: str = "", note: str = "") -> None:
+        from ..knowledge.store import FutureEvent
+        self.knowledge.add_event(FutureEvent(
+            symbol=symbol, ts_ns=ts_ns, kind=kind, severity=severity,
+            source=source, note=note))
+
+    def checkpoint_knowledge(self) -> str:
+        return self.knowledge.checkpoint(self.knowledge_path)
 
     def reset_day(self) -> None:
         self.micro.reset_day()

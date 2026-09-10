@@ -1,11 +1,8 @@
-"""Persistent, time-aware stock knowledge for GMQ.
+"""Persistent, time-aware stock knowledge and external research adapters."""
 
-The knowledge layer is intentionally separate from the predictive models. It
-stores identity, observed market history, future-known events and GMQ's own
-outcomes so the feature engine can expose that context to the decision stack.
-"""
 from .store import KnowledgeStore, StockKnowledge, FutureEvent
 from .pretrade import PreTradeKnowledge, PreTradeVerdict
+from ..news import NewsItem, NewsStore, PerplexityClient, PerplexityNewsMemory
 
 __all__ = [
     "KnowledgeStore",
@@ -13,4 +10,8 @@ __all__ = [
     "FutureEvent",
     "PreTradeKnowledge",
     "PreTradeVerdict",
+    "NewsItem",
+    "NewsStore",
+    "PerplexityClient",
+    "PerplexityNewsMemory",
 ]

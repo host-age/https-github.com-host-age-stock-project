@@ -44,7 +44,7 @@ class FakeSession:
         return FakeResponse({"output": []})
 
 
-def test_search_news_preserves_dates_and_sources(tmp_path):
+def test_search_news_preserves_dates_and_sources():
     client = PerplexityClient(api_key="test-key", min_request_interval_s=0)
     client.session = FakeSession()
     items = client.search_news(
@@ -69,7 +69,7 @@ def test_news_memory_deduplicates_persistently(tmp_path):
         published_at="2026-09-10T10:00:00Z",
         retrieved_at=1.0,
     )
-    assert store.upsert_many([item, item]) == 2
+    assert store.upsert([item, item]) == 2
     assert len(store.recent("TCS")) == 1
 
 

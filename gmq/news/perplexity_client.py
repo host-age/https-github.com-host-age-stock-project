@@ -16,6 +16,8 @@ from typing import Any, Optional
 
 import requests
 
+from ..core.capabilities import Capability, enabled as capability_enabled
+
 
 @dataclass(frozen=True)
 class NewsItem:
@@ -116,9 +118,7 @@ class PerplexityClient:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.api_key) and os.getenv("PERPLEXITY_ENABLED", "1").lower() in {
-            "1", "true", "yes", "on"
-        }
+        return capability_enabled(Capability.PERPLEXITY_NEWS)
 
     def _wait(self, min_interval_s: float) -> None:
         with self._pace:
@@ -128,8 +128,8 @@ class PerplexityClient:
             self._last_request = time.monotonic()
 
     def _post(self, path: str, payload: dict) -> dict:
-        if not self.api_key:
-            raise RuntimeError("PERPLEXITY_API_KEY is not configured")
+        if not self.enabled:
+            raise RuntimeError("Perplexity capability is not enabled")
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         last: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):

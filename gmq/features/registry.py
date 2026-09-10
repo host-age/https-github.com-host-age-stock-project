@@ -216,7 +216,15 @@ class FeatureEngine:
 
         self._freeze_names(vals)
         fv.values = vals
-        fv.ready = len(tf_scores) >= 2 and ms.n > 50
+        # Knowledge admissibility is a hard pre-trade safety gate: lack of
+        # evidence, extreme upcoming-event risk, or very poor liquidity should
+        # prevent the decision layer from producing an order at all.
+        knowledge_admissible = (
+            fv.knowledge_score >= 0.25
+            and fv.knowledge_event_risk < 0.90
+            and fv.liquidity >= 0.15
+        )
+        fv.ready = len(tf_scores) >= 2 and ms.n > 50 and knowledge_admissible
         self._cache[symbol] = fv
         return fv
 
@@ -231,6 +239,11 @@ class FeatureEngine:
         tick = mde.last_tick.get(symbol)
         spread_bps = getattr(tick, "spread_bps", 0.0)
         kn = self._knowledge_features(symbol, ts, px, spread_bps, ms.liquidity_score())
+        knowledge_admissible = (
+            kn["kn_knowledge_score"] >= 0.25
+            and kn["kn_event_risk"] < 0.90
+            and ms.liquidity_score() >= 0.15
+        )
         out = FeatureVector(
             symbol=symbol, ts=ts, values=dict(fv.values),
             alignment=fv.alignment, alignment_conflict=fv.alignment_conflict,
@@ -240,31 +253,13 @@ class FeatureEngine:
             knowledge_score=kn["kn_knowledge_score"],
             knowledge_event_risk=kn["kn_event_risk"],
             knowledge_win_rate=kn["kn_hist_win_rate"],
-            ready=fv.ready)
+            ready=fv.ready and knowledge_admissible)
         out.values.update(ms.features(px))
         out.values.update(kn)
         out.values["mx_liquidity"] = out.liquidity
         out.values["ctx_day_change"] = clamp(mde.day_change_pct(symbol), -12, 12)
         out.values["ctx_stale"] = 1.0 if mde.is_stale(symbol) else 0.0
         return out
-
-    def evaluate_pretrade(self, symbol: str, now_ns: int, *, direction: int,
-                          confidence: float, expected_edge_bps: float,
-                          stop: float = 0.0, current_price: float = 0.0) :
-        """Public pre-trade knowledge evaluation for the decision/execution layer."""
-        tick = None
-        spread_bps = 0.0
-        liquidity = 0.5
-        # Feature cache gives us the most recent known microstructure state.
-        cached = self._cache.get(symbol)
-        if cached is not None:
-            spread_bps = cached.values.get("mx_spread_bps", 0.0)
-            liquidity = cached.liquidity
-        return self.pretrade.evaluate(
-            symbol, now_ns, direction=direction, confidence=confidence,
-            expected_edge_bps=expected_edge_bps,
-            current_spread_bps=spread_bps, liquidity=liquidity,
-            data_fresh=True)
 
     @staticmethod
     def _tf_direction(blk: Dict[str, float], tfv: str) -> float:
@@ -315,9 +310,9 @@ class FeatureEngine:
     def on_minute(self, prices: Dict[str, float]) -> None:
         self.cross.on_bar_close(prices)
         self._knowledge_minutes += 1
-        # Persistence is deliberately amortised outside the tick path.
         if self._knowledge_minutes % 5 == 0:
-            self.knowledge.prune_expired_events(max((t.last_ts_ns for t in self.knowledge._stocks.values()), default=0))
+            last_ts = max((t.last_ts_ns for t in self.knowledge._stocks.values()), default=0)
+            self.knowledge.prune_expired_events(last_ts)
             self.knowledge.checkpoint(self.knowledge_path)
 
     def add_future_event(self, symbol: str, ts_ns: int, kind: str,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from pathlib import Path
 from typing import Iterable
 
@@ -30,12 +31,12 @@ def _pick(fieldnames: Iterable[str], names: tuple[str, ...], required: bool = Tr
 
 
 def normalize_csv_file(path: str | Path) -> ReplayDataset:
-    """Normalize one CSV file while preserving chronological input order.
+    """Normalize one CSV into the canonical GMQ replay dataset.
 
-    Files are expected to contain a timestamp, symbol and OHLC fields. Volume
-    is optional and defaults to zero. The resulting dataset is sorted by
-    timestamp/symbol because downstream replay operates on a deterministic
-    chronological stream.
+    Timestamps must already be non-decreasing in the source file. We reject
+    out-of-order data rather than sorting it, because silently reordering a
+    partially corrupt or mis-exported dataset can hide a point-in-time error in
+    historical validation.
     """
     path = Path(path)
     with path.open(newline="", encoding="utf-8-sig") as fh:
@@ -43,23 +44,36 @@ def normalize_csv_file(path: str | Path) -> ReplayDataset:
         fields = reader.fieldnames or []
         cols = {k: _pick(fields, v, k != "volume") for k, v in ALIASES.items()}
         rows: list[ReplayRow] = []
+        prev_ts: int | None = None
         for line_no, raw in enumerate(reader, start=2):
             try:
                 ts = raw[cols["timestamp"]]
                 from ...backtest.nse_replay import _parse_ts
                 ts_ns = _parse_ts(ts)
+                if prev_ts is not None and ts_ns < prev_ts:
+                    raise ReplayDataError("timestamps out of order")
+                prev_ts = ts_ns
+
                 symbol = raw[cols["symbol"]].strip().upper()
                 o = float(raw[cols["open"]])
                 h = float(raw[cols["high"]])
                 l = float(raw[cols["low"]])
                 c = float(raw[cols["close"]])
                 v = int(float(raw[cols["volume"]])) if cols["volume"] else 0
-                if not symbol or min(o, h, l, c) <= 0 or h < max(o, c) or l > min(o, c) or h < l or v < 0:
+
+                if not symbol or not all(math.isfinite(x) for x in (o, h, l, c)):
+                    raise ReplayDataError("invalid security row")
+                if min(o, h, l, c) <= 0 or h < max(o, c) or l > min(o, c) or h < l or v < 0:
                     raise ReplayDataError("invalid security row")
                 rows.append(ReplayRow(ts_ns, symbol, o, h, l, c, v))
             except Exception as exc:
                 raise ReplayDataError(f"line {line_no}: {exc}") from exc
+
     if not rows:
         raise ReplayDataError("no data rows")
-    rows.sort(key=lambda r: (r.ts, r.symbol))
-    return ReplayDataset(rows, sorted({r.symbol for r in rows}), rows[0].ts, rows[-1].ts)
+    return ReplayDataset(
+        rows,
+        sorted({r.symbol for r in rows}),
+        rows[0].ts,
+        rows[-1].ts,
+    )

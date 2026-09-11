@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 from typing import Iterable
 
-from ..data.feed import ReplayRow
+from ..feed import ReplayRow
 
 
 class NSEArchive:

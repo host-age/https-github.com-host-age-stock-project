@@ -319,11 +319,18 @@ async function tick(){
    cls(x.pnl)+'">'+money(x.pnl)+'</td><td class="'+cls(x.r)+'">'+
    (x.r||0).toFixed(2)+'R</td><td class=muted>'+(x.regime||'')+'</td></tr>').join('');
  if(!rows) rows='<tr><td colspan=8 class=muted>No open positions.</td></tr>';
+ const kn=s.knowledge||{};
+ const knLine=kn.symbols_tracked
+   ? 'NSE knowledge sync: '+kn.symbols_synced+'/'+kn.symbols_tracked+' symbols synced'+
+     (kn.symbols_stale?' ('+kn.symbols_stale+' stale)':'')+
+     (kn.mcp_enabled?'':' &mdash; NSE_MCP_ENABLED is off')
+   : '';
  b.innerHTML='<div class=grid>'+cards+'</div><table><thead><tr><th>Symbol</th>'+
    '<th>Qty</th><th>Avg</th><th>LTP</th><th>Stop</th><th>P&L</th><th>R</th>'+
    '<th>Regime</th></tr></thead><tbody>'+rows+'</tbody></table>'+
    '<p class=muted style=margin-top:12px>Search '+(s.mean_search_ms||0)+
-   'ms avg &middot; '+(s.labels||0)+' labels &middot; paper money, no real orders.</p>';
+   'ms avg &middot; '+(s.labels||0)+' labels &middot; paper money, no real orders.</p>'+
+   (knLine?'<p class=muted>'+knLine+'</p>':'');
 }
 tick(); setInterval(tick,2000);
 </script></body></html>"""

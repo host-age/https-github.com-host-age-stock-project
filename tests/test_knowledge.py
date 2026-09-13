@@ -51,6 +51,57 @@ def test_pretrade_blocks_material_future_event():
     assert "event_risk_limit" in verdict.reason
 
 
+def test_coverage_report_without_mcp_reports_disabled():
+    store = KnowledgeStore(window=32)
+    store.register("RELIANCE")
+    store.register("TCS")
+    report = store.coverage_report(now_ns=10_000)
+    assert report["mcp_enabled"] is False
+    assert report["symbols_tracked"] == 2
+    assert report["symbols_synced"] == 0
+    assert report["fraction_synced"] == 0.0
+    for sym in ("RELIANCE", "TCS"):
+        assert report["symbols"][sym]["mcp_synced"] is False
+        assert report["symbols"][sym]["mcp_age_s"] is None
+        assert report["symbols"][sym]["mcp_stale"] is True
+
+
+def test_coverage_report_marks_fresh_sync_as_not_stale():
+    store = KnowledgeStore(window=32)
+    store.register("INFY")
+    now_ns = 100 * 1_000_000_000
+    tr = store._stocks["INFY"]
+    tr.mcp_attempts = 3
+    tr.mcp_successes = 2
+    tr.mcp_last_success_ns = now_ns - 5 * 1_000_000_000  # 5s ago
+
+    report = store.coverage_report(now_ns)
+    sym = report["symbols"]["INFY"]
+    assert sym["mcp_synced"] is True
+    assert sym["mcp_stale"] is False
+    assert sym["mcp_age_s"] == 5.0
+    assert report["symbols_synced"] == 1
+    assert report["fraction_synced"] == 1.0
+
+
+def test_coverage_report_flags_stale_sync_and_surfaces_last_error():
+    store = KnowledgeStore(window=32)
+    store.register("HDFCBANK")
+    now_ns = 10_000 * 1_000_000_000
+    tr = store._stocks["HDFCBANK"]
+    stale_after_s = 3.0 * store._mcp_interval_s
+    tr.mcp_successes = 1
+    tr.mcp_last_success_ns = now_ns - int((stale_after_s + 60) * 1_000_000_000)
+    tr.mcp_last_error = "ConnectionError: timed out"
+
+    report = store.coverage_report(now_ns)
+    sym = report["symbols"]["HDFCBANK"]
+    assert sym["mcp_synced"] is True       # it did sync at some point...
+    assert sym["mcp_stale"] is True        # ...but that data is now too old to trust
+    assert sym["mcp_last_error"] == "ConnectionError: timed out"
+    assert report["symbols_stale"] == 1
+
+
 def test_pretrade_approves_clean_setup():
     store = KnowledgeStore(window=128)
     store.register("SBIN", sector="BANK")

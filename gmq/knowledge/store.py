@@ -63,7 +63,8 @@ class StockKnowledge:
 class _Track:
     __slots__ = ("profile", "prices", "returns", "wins", "losses", "pnl",
                  "events", "last_ts_ns", "current_volume", "current_spread_bps",
-                 "current_liquidity")
+                 "current_liquidity", "mcp_last_success_ns", "mcp_attempts",
+                 "mcp_successes", "mcp_last_error")
 
     def __init__(self, profile: StockKnowledge, window: int):
         self.profile = profile
@@ -77,6 +78,15 @@ class _Track:
         self.current_volume = 0
         self.current_spread_bps = 0.0
         self.current_liquidity = 0.5
+        # NSE MCP sync health -- never persisted, never gates a decision by
+        # itself; purely so an operator can see whether the "collected" data
+        # actually arrived, and how stale it is, instead of the sync failing
+        # silently into an unchanged (and therefore indistinguishable-looking)
+        # profile.
+        self.mcp_last_success_ns = 0
+        self.mcp_attempts = 0
+        self.mcp_successes = 0
+        self.mcp_last_error = ""
 
 
 class KnowledgeStore:
@@ -91,6 +101,8 @@ class KnowledgeStore:
         self._mcp_thread: Optional[threading.Thread] = None
         self._mcp_clients = None
         self._mcp_interval_s = max(float(os.getenv("NSE_MCP_REFRESH_S", "300")), 60.0)
+        self._mcp_last_cycle_ns = 0
+        self._mcp_cycles = 0
         if path:
             self.load(path)
         self._start_mcp_if_enabled()
@@ -303,18 +315,82 @@ class KnowledgeStore:
             for symbol in symbols:
                 if self._stop.is_set():
                     break
+                with self._lock:
+                    tr = self._stocks.get(symbol)
+                    if tr is not None:
+                        tr.mcp_attempts += 1
                 try:
                     self._refresh_from_nse(symbol)
-                except Exception:
+                    with self._lock:
+                        tr = self._stocks.get(symbol)
+                        if tr is not None:
+                            tr.mcp_successes += 1
+                            tr.mcp_last_success_ns = time.time_ns()
+                            tr.mcp_last_error = ""
+                except Exception as e:
                     # MCP failure must degrade to existing local/Kite knowledge;
-                    # it must never stop the market engine.
+                    # it must never stop the market engine -- but it must not
+                    # vanish either, or "collecting data" and "silently not
+                    # collecting data" look identical from the outside.
+                    with self._lock:
+                        tr = self._stocks.get(symbol)
+                        if tr is not None:
+                            tr.mcp_last_error = f"{type(e).__name__}: {e}"
                     continue
+            with self._lock:
+                self._mcp_cycles += 1
+                self._mcp_last_cycle_ns = time.time_ns()
             try:
                 if self.path:
                     self.checkpoint(self.path)
             except Exception:
                 pass
             self._stop.wait(self._mcp_interval_s)
+
+    def coverage_report(self, now_ns: int) -> dict:
+        """Is the NSE MCP sync actually delivering fresh data, per symbol?
+
+        Read-only and side-effect-free -- purely for operators/dashboards to
+        answer "did the collection step work" rather than inferring it from
+        an unmoving profile. ``stale_after_s`` is generous (3x the refresh
+        interval) since a single missed cycle is normal jitter, not a fault.
+        """
+        stale_after_s = 3.0 * self._mcp_interval_s
+        with self._lock:
+            mcp_enabled = bool(self._mcp_thread and self._mcp_thread.is_alive())
+            symbols = {}
+            synced = 0
+            stale = 0
+            for symbol, tr in self._stocks.items():
+                age_s = None
+                if tr.mcp_last_success_ns:
+                    age_s = max((now_ns - tr.mcp_last_success_ns) / 1e9, 0.0)
+                is_stale = age_s is None or age_s > stale_after_s
+                if tr.mcp_successes:
+                    synced += 1
+                if is_stale:
+                    stale += 1
+                symbols[symbol] = {
+                    "observed_ticks": tr.profile.observed_ticks,
+                    "mcp_attempts": tr.mcp_attempts,
+                    "mcp_successes": tr.mcp_successes,
+                    "mcp_synced": tr.mcp_successes > 0,
+                    "mcp_age_s": round(age_s, 1) if age_s is not None else None,
+                    "mcp_stale": is_stale,
+                    "mcp_last_error": tr.mcp_last_error,
+                }
+            total = len(self._stocks)
+            return {
+                "mcp_enabled": mcp_enabled,
+                "mcp_cycles": self._mcp_cycles,
+                "mcp_last_cycle_age_s": round((now_ns - self._mcp_last_cycle_ns) / 1e9, 1)
+                if self._mcp_last_cycle_ns else None,
+                "symbols_tracked": total,
+                "symbols_synced": synced,
+                "symbols_stale": stale,
+                "fraction_synced": round(synced / total, 4) if total else 0.0,
+                "symbols": symbols,
+            }
 
     def _refresh_from_nse(self, symbol: str) -> None:
         if not self._mcp_clients:

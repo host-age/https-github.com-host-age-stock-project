@@ -995,6 +995,7 @@ class TradingEngine:
                 for p in self.portfolio.open_positions],
             "regimes": {s: self.regime.snapshot(s) for s in self.symbols},
             "loss_causes": self.monitor.cause_summary(),
+            "knowledge": self.features.knowledge.coverage_report(self.clock.now_ns()),
         }
 
     def report(self, wall_s: float = 0.0) -> dict:

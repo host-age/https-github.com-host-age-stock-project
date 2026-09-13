@@ -127,6 +127,23 @@ class StreamableHttpMcpClient:
         })
         return result.get("result", result)
 
+    @staticmethod
+    def _symbol_args(schema: dict, symbol: str) -> Dict[str, Any]:
+        """Map ``symbol`` onto whichever of a tool's advertised parameters
+        actually accept it, and nothing else -- a tool we discovered by
+        heuristic name/description match should only ever receive the
+        fields it documented, never every property we happen to know a
+        value for."""
+        props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        args: Dict[str, Any] = {}
+        for name in props:
+            lname = str(name).lower()
+            if lname in {"symbol", "tradingsymbol", "security", "ticker", "scrip"}:
+                args[name] = symbol
+            elif lname in {"symbols", "tickers"}:
+                args[name] = [symbol]
+        return args
+
     def close(self) -> None:
         try:
             self.session.close()

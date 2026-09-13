@@ -401,23 +401,11 @@ class KnowledgeStore:
         history_tool = bh.choose_tool("bhavcopy", "historical", "equity", "security", "price")
         now = time.time_ns()
         if current_tool:
-            result = cm.call_tool(current_tool.name, self._tool_args(current_tool.input_schema, symbol))
+            result = cm.call_tool(current_tool.name, cm._symbol_args(current_tool.input_schema, symbol))
             self._merge_numeric(symbol, result, "current")
         if history_tool:
-            result = bh.call_tool(history_tool.name, self._tool_args(history_tool.input_schema, symbol))
+            result = bh.call_tool(history_tool.name, bh._symbol_args(history_tool.input_schema, symbol))
             self._merge_numeric(symbol, result, "historical")
-
-    @staticmethod
-    def _tool_args(schema: dict, symbol: str) -> dict:
-        props = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        args = {}
-        for name in props:
-            lname = str(name).lower()
-            if lname in {"symbol", "tradingsymbol", "security", "ticker", "scrip"}:
-                args[name] = symbol
-            elif lname in {"symbols", "tickers"}:
-                args[name] = [symbol]
-        return args
 
     def _merge_numeric(self, symbol: str, result, section: str) -> None:
         symbol = symbol.upper()

@@ -42,16 +42,27 @@ positions, and live decisions, refreshing every 2 seconds.
 Kite access tokens **expire every morning (~06:00 IST)**, so once a day you
 generate a fresh one and hand it to the service — no redeploy needed.
 
-**Easiest:** run the login helper on any machine with Python + `kiteconnect`:
+**Easiest:** run the login helper on any machine with Python + `kiteconnect`,
+and let it push the token straight to the service instead of a separate curl:
+
+```bash
+python3 tools/kite_login.py login --api-key YOUR_KEY --api-secret YOUR_SECRET \
+  --server-url https://YOUR-SERVICE.onrender.com --admin-secret YOUR_ADMIN_SECRET
+# open the printed URL, log in, paste the request_token; it saves the token
+# locally AND pushes it to the service in the same step
+```
+
+The login itself (opening the URL, Zerodha's own password + 2FA) still needs
+you — that is deliberate, since automating it would mean storing your trading
+account password or TOTP secret in this codebase, which is a worse trade than
+one manual login a day. `--server-url` only removes the second step.
+
+Without `--server-url`, do it in two steps instead:
 
 ```bash
 python3 tools/kite_login.py login --api-key YOUR_KEY --api-secret YOUR_SECRET
 # open the printed URL, log in, paste the request_token; it prints access_token
-```
 
-Then send that token to the running service:
-
-```bash
 curl -X POST https://YOUR-SERVICE.onrender.com/set-token \
   -H "Content-Type: application/json" \
   -d '{"secret":"YOUR_ADMIN_SECRET","access_token":"TODAYS_TOKEN"}'

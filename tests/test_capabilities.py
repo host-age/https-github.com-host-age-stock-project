@@ -1,4 +1,5 @@
 import importlib
+import json
 
 from gmq.core.capabilities import Capability, all_statuses, enabled, status
 
@@ -50,3 +51,26 @@ def test_local_ling_runtime_needs_no_openrouter_key(monkeypatch):
     st = cap.status(Capability.LING_FIN)
     assert st.configured is True
     assert st.enabled is True
+
+
+def test_cli_capabilities_command_lists_every_capability(capsys):
+    from gmq.cli import cmd_capabilities
+
+    class Args:
+        json = False
+
+    assert cmd_capabilities(Args()) == 0
+    out = capsys.readouterr().out
+    for cap in Capability:
+        assert cap.value in out
+
+
+def test_cli_capabilities_command_json_matches_all_statuses(capsys):
+    from gmq.cli import cmd_capabilities
+
+    class Args:
+        json = True
+
+    cmd_capabilities(Args())
+    out = capsys.readouterr().out
+    assert json.loads(out) == all_statuses()

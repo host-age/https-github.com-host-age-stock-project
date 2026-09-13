@@ -46,6 +46,24 @@ def test_status_json_without_engine(client):
     assert r.status_code == 200 and "state" in r.json
 
 
+def test_status_includes_capabilities(client):
+    _, c = client
+    r = c.get("/api/status")
+    caps = r.json["capabilities"]
+    assert isinstance(caps, dict) and "kite_execution" in caps
+    assert caps["kite_execution"]["enabled"] is False  # no creds in this fixture
+
+
+def test_capabilities_endpoint_is_secret_free(client, monkeypatch):
+    _, c = client
+    monkeypatch.setenv("KITE_API_KEY", "shh-do-not-leak-me")
+    r = c.get("/api/capabilities")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "shh-do-not-leak-me" not in body
+    assert r.json["kite_execution"]["configured"] is False  # access token still missing
+
+
 def test_set_token_requires_secret(client, monkeypatch):
     server, c = client
     monkeypatch.setenv("ADMIN_SECRET", "s3cret")
@@ -67,3 +85,5 @@ def test_summary_is_secret_free_and_shaped(client):
     # the compact desk summary must never leak the admin secret or a token
     assert "admin_secret" not in body and "access_token" not in body
     assert "state" in r.json and "live" in r.json
+    assert isinstance(r.json["capabilities"], dict)
+    assert all(isinstance(v, bool) for v in r.json["capabilities"].values())

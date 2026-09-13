@@ -53,7 +53,7 @@ def status(capability: Capability) -> CapabilityStatus:
         return CapabilityStatus(capability, enabled, enabled,
                                 "enabled" if enabled else "NSE_MCP_ENABLED is off")
 
-    if capability is Capability.KITE_EXECUTION:
+    if capability == Capability.KITE_EXECUTION:
         configured = bool(values.get("KITE_API_KEY")) and bool(values.get("KITE_ACCESS_TOKEN"))
         live = _truthy(os.getenv("GMQ_LIVE_TRADING"))
         enabled = configured and live
@@ -65,18 +65,18 @@ def status(capability: Capability) -> CapabilityStatus:
             reason = "enabled"
         return CapabilityStatus(capability, enabled, configured, reason)
 
-    if capability is Capability.KITE_MARKET_DATA:
+    if capability == Capability.KITE_MARKET_DATA:
         configured = bool(values.get("KITE_API_KEY")) and bool(values.get("KITE_ACCESS_TOKEN"))
         return CapabilityStatus(capability, configured, configured,
                                 "enabled" if configured else "Kite credentials are not configured")
 
-    if capability is Capability.PERPLEXITY_NEWS:
+    if capability == Capability.PERPLEXITY_NEWS:
         configured = bool(values.get("PERPLEXITY_API_KEY"))
         enabled = configured and _truthy(values.get("PERPLEXITY_ENABLED"), default=True)
         return CapabilityStatus(capability, enabled, configured,
                                 "enabled" if enabled else "Perplexity disabled or key missing")
 
-    if capability is Capability.LING_FIN:
+    if capability == Capability.LING_FIN:
         configured = bool(values.get("OPENROUTER_API_KEY")) or bool(os.getenv("LING_FIN_BASE_URL", "").strip())
         enabled = configured and _truthy(values.get("LING_FIN_ENABLED"), default=True)
         return CapabilityStatus(capability, enabled, configured,

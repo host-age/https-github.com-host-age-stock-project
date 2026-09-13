@@ -35,6 +35,7 @@ from typing import Optional
 
 from flask import Flask, jsonify, request, Response
 
+from ..core.capabilities import all_statuses
 from ..core.config import Config
 from .engine import TradingEngine
 
@@ -142,6 +143,7 @@ def health() -> Response:
 @app.route("/api/status")
 def api_status() -> Response:
     out = dict(_status)
+    out["capabilities"] = all_statuses()
     with _lock:
         eng = _engine
     if eng is not None:
@@ -150,6 +152,19 @@ def api_status() -> Response:
         except Exception as e:
             out["snapshot_error"] = str(e)
     return jsonify(out)
+
+
+@app.route("/api/capabilities")
+def api_capabilities() -> Response:
+    """Which external integrations are configured/enabled, and why not.
+
+    Secret-free by construction -- ``all_statuses()`` reports booleans and a
+    human-readable reason per capability, never a credential value. Meant to
+    answer "is Kite/Perplexity/Ling actually live right now" in one request,
+    without cross-referencing env vars against ``/api/status``'s free-form
+    ``detail`` string.
+    """
+    return jsonify(all_statuses())
 
 
 @app.route("/api/summary")
@@ -164,7 +179,13 @@ def api_summary() -> Response:
     with _lock:
         eng = _engine
         state = _status["state"]
-    out = {"state": state, "live": eng is not None}
+    out = {
+        "state": state,
+        "live": eng is not None,
+        "capabilities": {
+            name: st["enabled"] for name, st in all_statuses().items()
+        },
+    }
     if eng is not None:
         try:
             s = eng.snapshot()
@@ -244,12 +265,15 @@ _DASHBOARD_HTML = """<!doctype html><html><head><meta charset=utf-8>
  .muted{color:#8b949e;font-size:13px}
  .setup{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;line-height:1.7}
  code{background:#21262d;padding:1px 6px;border-radius:5px}
+ #caps{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
+ .caps-pill{padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600;cursor:default}
 </style></head><body>
 <header>
  <h1>&#9819; NSE Grandmaster &mdash; Paper Trading (live prices, no real orders)</h1>
  <span id=state class="pill idle">connecting&hellip;</span>
 </header>
 <main>
+ <div id=caps></div>
  <div id=body><p class=muted>Loading&hellip;</p></div>
 </main>
 <script>
@@ -261,6 +285,13 @@ async function tick(){
  const map={running:'ok',session_closed:'idle',waiting_for_credentials:'warn',
    starting:'warn',error:'bad'};
  el.className='pill '+(map[st]||'idle'); el.textContent=st.replace(/_/g,' ');
+ const caps=r.capabilities||{};
+ document.getElementById('caps').innerHTML=Object.keys(caps).sort().map(name=>{
+   const c=caps[name], on=c.enabled, half=!c.enabled&&c.configured;
+   const cls=on?'ok':half?'warn':'idle';
+   return '<span class="caps-pill '+cls+'" title="'+c.reason+'">'+
+     name.replace(/_/g,' ')+(on?' ✓':half?' ⚠':' –')+'</span>';
+ }).join('');
  const b=document.getElementById('body');
  if(st==='waiting_for_credentials'||st==='error'){
    b.innerHTML='<div class=setup><b>'+(st==='error'?'Problem':'Setup needed')+

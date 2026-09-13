@@ -7,6 +7,7 @@
     python -m gmq stress
     python -m gmq dashboard  --run runs/session
     python -m gmq verify
+    python -m gmq capabilities [--json]
 """
 from __future__ import annotations
 
@@ -133,6 +134,18 @@ def cmd_verify(args) -> int:
     return subprocess.call([sys.executable, "-m", "pytest", "tests/", "-q"])
 
 
+def cmd_capabilities(args) -> int:
+    from .core.capabilities import all_statuses
+    statuses = all_statuses()
+    if args.json:
+        print(json.dumps(statuses, indent=2))
+        return 0
+    for name, st in sorted(statuses.items()):
+        mark = "on " if st["enabled"] else ("cfg" if st["configured"] else "off")
+        print(f"  [{mark}] {name:<18} {st['reason']}")
+    return 0
+
+
 def _print_report(rep: dict) -> None:
     t, e = rep.get("trades", {}), rep.get("equity", {})
     print("\n" + "=" * 70)
@@ -197,6 +210,10 @@ def main(argv=None) -> int:
 
     v = sub.add_parser("verify", help="run the test suite")
     v.set_defaults(fn=cmd_verify)
+
+    c = sub.add_parser("capabilities", help="which integrations are configured/enabled")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(fn=cmd_capabilities)
 
     args = p.parse_args(argv)
     return args.fn(args)

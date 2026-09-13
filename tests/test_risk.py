@@ -19,10 +19,23 @@ from gmq.risk.stops import StopPolicy
 from gmq.core.types import Prediction
 
 
-def setup(equity=1_000_000.0, **lim):
+def setup(equity=1_000_000.0, cross=None, **lim):
     limits = RiskLimits(**lim)
     pf = Portfolio(equity)
-    return limits, pf, RiskEngine(limits, pf)
+    return limits, pf, RiskEngine(limits, pf, cross=cross)
+
+
+class _FlatCorrelationCross:
+    """Minimal stand-in for CrossSectionalEngine: no return history (so
+    var_es falls back to its default 1.5% per-bar vol for every symbol) and
+    no cross-symbol correlation, just enough for Portfolio.var_es to run."""
+
+    def __init__(self):
+        self.ret = {}
+
+    def corr_matrix(self, syms):
+        import numpy as np
+        return np.eye(len(syms))
 
 
 # ---------------------------------------------------------------- limits
@@ -168,6 +181,76 @@ def test_excess_slippage_halt():
     for _ in range(30):
         re.on_slippage(45.0)
     assert re.monitor(ts=1) == HaltReason.SLIPPAGE
+
+
+def test_reject_rate_halt():
+    """A broker rejecting a large share of orders is caught on its own --
+    it must not take a P&L limit tripping first to notice the plumbing is
+    broken."""
+    _l, _pf, re = setup(max_reject_rate=0.2)
+    for i in range(40):
+        re.on_order_sent(i)
+    for i in range(15):                 # 15/40 = 37.5% > 20% cap
+        re.on_order_rejected(i)
+    assert re.monitor(ts=1) == HaltReason.REJECT_RATE
+
+
+def test_reject_rate_needs_a_minimum_sample_before_it_can_fire():
+    """A handful of early rejects must not halt trading before there is
+    enough traffic to tell a bad ratio from bad luck."""
+    _l, _pf, re = setup(max_reject_rate=0.2)
+    for i in range(10):                 # below the 40-order minimum
+        re.on_order_sent(i)
+    for i in range(9):                  # 9/10 = 90%, would trip if counted
+        re.on_order_rejected(i)
+    assert re.monitor(ts=1) is None
+
+
+def test_loss_velocity_halt():
+    """A fast bleed must halt even on a day that has not yet breached the
+    (slower-moving) daily-loss limit."""
+    from gmq.core.types import NS
+    _l, pf, re = setup(max_daily_loss_pct=50.0,   # keep the slower limit out
+                       loss_velocity_halt_pct=1.0,
+                       loss_velocity_window_s=900.0)
+    now = 10_000 * NS
+    pf.recent_pnl.append((now - int(60 * NS), -20_000.0))  # -2% inside 900s
+    assert re.monitor(ts=now) == HaltReason.LOSS_VELOCITY
+
+
+def test_loss_velocity_ignores_pnl_outside_the_window():
+    """The same loss, once it has aged out of the window, must not keep
+    the halt firing forever."""
+    from gmq.core.types import NS
+    _l, pf, re = setup(max_daily_loss_pct=50.0,
+                       loss_velocity_halt_pct=1.0,
+                       loss_velocity_window_s=900.0)
+    now = 100_000 * NS
+    pf.recent_pnl.append((now - int(2000 * NS), -20_000.0))  # older than 900s
+    assert re.monitor(ts=now) is None
+
+
+def test_var_breach_halt():
+    """An overconcentrated book can breach parametric VaR/ES with no single
+    limit above having caught it -- this is the check that actually looks
+    at portfolio-level risk rather than one position at a time."""
+    cross = _FlatCorrelationCross()
+    _l, pf, re = setup(cross=cross, max_var_pct=1.0, max_es_pct=1.0,
+                       max_risk_per_trade_pct=99.0, max_position_pct=99.0,
+                       max_gross_exposure_pct=999.0, max_net_exposure_pct=999.0)
+    p = pf.position("RELIANCE")
+    p.qty = 1000
+    p.avg_price = 1000.0
+    pf.mark("RELIANCE", 1000.0)         # 100% of equity in one name
+    assert re.monitor(ts=1) == HaltReason.VAR_BREACH
+
+
+def test_var_breach_does_not_fire_with_no_open_positions():
+    """var_es is only meaningful with an actual book -- a flat portfolio
+    must never halt on it."""
+    cross = _FlatCorrelationCross()
+    _l, _pf, re = setup(cross=cross, max_var_pct=0.001, max_es_pct=0.001)
+    assert re.monitor(ts=1) is None
 
 
 def test_halt_still_allows_closing_positions():

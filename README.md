@@ -174,6 +174,36 @@ precision on its strongest class. Honestly: this is the weakest component.
 Regime is used as a feature and a gate, and its confidence is exposed so
 downstream logic can discount it.
 
+**Re-measured** with `tools/eval_regime.py` (60,000 steps, 6 symbols, 522
+scored observations): **31.6% accuracy** — at or below the low end of the
+range above, not within it. Per-class precision is uneven and two regimes
+were never called at all in this run: TRENDING_DOWN 76.3%, TRENDING_UP 67.7%,
+MEAN_REVERTING 37.3%, BREAKOUT 5.5%, HIGH_VOL 2.3%, LOW_VOL 0.0% (predicted,
+never correct), **EVENT_DRIVEN and ILLIQUID: never predicted at all** — zero
+entries in either column of the confusion matrix.
+
+**A more concerning finding this run surfaced that the original numbers
+didn't report: the confidence score is close to uninformative where it
+matters most.** 404 of the 522 observations (77%) fall in the detector's own
+highest-confidence bucket (≥0.85) — and accuracy there is **34.4%**, barely
+above the overall average and nowhere near what "confident" should imply.
+The mid buckets are no better ordered (0.50–0.70: 28.9%, 0.70–0.85: 22.1%),
+so `confidence` is not simply "high confidence sometimes wrong" — across most
+of its observed range it barely separates right from wrong at all. The
+README's advice above to let "downstream logic discount low confidence"
+assumes confidence is at least ordinally informative; on this evidence, it is
+not, since the model is *most* confident *most often* and that bucket's
+accuracy is unremarkable.
+
+One run (n=522) isn't a walk-forward and shouldn't be over-read on its own,
+but the gap between the documented 79–84% best-class precision and this run's
+76.3% is small while the calibration failure is not — that's a genuine
+open item, not measurement noise. `gmq/regime/detector.py` had zero dedicated
+tests before this session; `tests/test_regime.py` now locks down the filter's
+*structural* behaviour (warm-up gating, the confirmation delay, the
+self-trapping-bug regression), but proving or improving the *emission model's*
+actual calibration is a separate, harder problem those tests don't touch.
+
 #### Latency
 
 Search: 7.7ms mean / 22.8ms p99 in the full engine against a 25ms budget.

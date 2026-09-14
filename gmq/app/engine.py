@@ -308,7 +308,14 @@ class TradingEngine:
                 # repointed -- holding the old one is a silent no-op.
                 self.stops.giveback = pol
                 self.search.moves.giveback = pol
-                if self.journal and pol.fitted:
+                if self.journal:
+                    # Log every attempt, not just a successful one. A run
+                    # short on trades silently living on unfit defaults for
+                    # its entire duration -- exactly what "insufficient
+                    # sample" or "rejected: ..." means -- is precisely the
+                    # kind of thing that must not disappear from the record;
+                    # a reader of the journal should never have to infer it
+                    # from the *absence* of an event.
                     self.journal.event(self.clock.now_ns(), "policy_fit", "",
                                        pol.as_dict())
 

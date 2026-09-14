@@ -270,3 +270,48 @@ def test_giveback_does_not_arm_below_activation():
               regime=Regime.LOW_VOL, r_multiple=0.5, peak_r=0.5,
               risk_per_share=2.0)
     assert sp.update(Side.BUY, **kw) == off.update(Side.BUY, **kw)
+
+
+# --------------------------------------------- engine wiring: fit visibility
+
+
+def test_feed_excursions_journals_a_rejected_fit_not_just_a_successful_one():
+    """A run too short for the give-back policy to ever validate must not
+    look, from the journal, identical to a run where nothing was even tried.
+
+    Found on a real 3-day/124-trade run: giveback_min_samples=120 meant the
+    fit was attempted at most once, and the engine only journalled it
+    `if pol.fitted` -- so an entire run spent on unfit defaults produced zero
+    policy_fit events, indistinguishable from the fit never running at all.
+    """
+    from types import SimpleNamespace
+    from gmq.app.engine import TradingEngine
+    from gmq.risk.portfolio import TradeRecord
+    from gmq.analytics.excursion import ExcursionBook
+    from gmq.core.config import Config
+
+    events = []
+    cfg = Config()
+    cfg.search.giveback_refit_every = 1
+    cfg.search.giveback_min_samples = 999   # unreachable in this test
+    fake_engine = SimpleNamespace(
+        cfg=cfg,
+        excursions=ExcursionBook(min_samples=cfg.search.giveback_min_samples),
+        journal=SimpleNamespace(event=lambda *a: events.append(a)),
+        stops=SimpleNamespace(giveback=None),
+        search=SimpleNamespace(moves=SimpleNamespace(giveback=None)),
+        clock=SimpleNamespace(now_ns=lambda: 123),
+        _paths={},
+        _closes_since_fit=0,
+    )
+    rec = TradeRecord(symbol="X", side=1, qty=10, entry_px=100.0, exit_px=101.0,
+                      entry_ns=0, exit_ns=1, pnl=10.0, fees=1.0, r_multiple=0.5,
+                      mfe=15.0, mae=-5.0, exit_reason="target", initial_risk=20.0)
+
+    TradingEngine._feed_excursions(fake_engine, rec)
+
+    assert len(events) == 1, "a rejected/unfitted attempt must still be logged"
+    ts, kind, symbol, payload = events[0]
+    assert kind == "policy_fit"
+    assert payload["fitted"] is False
+    assert "insufficient sample" in payload["note"]

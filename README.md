@@ -180,7 +180,7 @@ Search: 7.7ms mean / 22.8ms p99 in the full engine against a 25ms budget.
 
 #### The strategy itself
 
-A clean 3-session run, 8 symbols, ₹10,00,000, no halts:
+**First measurement** — a clean 3-session run, 8 symbols, ₹10,00,000, no halts:
 
 | | |
 |---|---|
@@ -192,20 +192,52 @@ A clean 3-session run, 8 symbols, ₹10,00,000, no halts:
 | Position mismatches | 1 |
 | Stops placed / triggered | 763 / 8 |
 
-**It loses a small amount after costs.** That is the honest read: the machinery
-works end to end and is internally consistent — all seven leakage checks pass,
-every R-multiple is measurable, reconciliation is clean — but the search is not
-finding an edge that survives Indian transaction costs at this trade frequency.
+This run is what motivated two fixes: a hysteresis rule so a marginal preference
+doesn't close a position (`gmq/risk/stops.py`, tested in `tests/test_churn.py`),
+and `GivebackPolicy` (`gmq/analytics/excursion.py`) — a give-back stop *fitted*
+to the trade's own excursion distribution rather than guessed, with a bootstrap
+reality-check and a neighbour-robustness guard against fitting noise.
 
-Two things stand out as the places to look, and neither is a bug:
+**Re-measured after those fixes, 3 days, the default 10-symbol universe:**
 
-- **Median holding period is 15 seconds.** The engine is scalping, not running
-  the multi-timeframe theses the architecture is built for. The decision
-  cadence and the exit side of the objective are letting it churn.
-- **61% of losing trades were meaningfully in profit first** (`excursions.
-  losers_that_were_winners`). The exit policy gives back winners. That is a
-  target/trail calibration problem, and the MAE/MFE block exists precisely to
-  make it visible.
+| | |
+|---|---|
+| Trades | 124 (27.4% won) |
+| Return | **−0.395%** after all costs |
+| Expectancy | −0.114R |
+| Profit factor | 0.38 |
+| Sharpe / Sortino | −15.92 / −3.68 |
+| Max drawdown | 0.47% |
+| Halts | `CONSECUTIVE_LOSSES` (engine paused itself for ~0.75 days) |
+
+**Neither problem is fixed, and this run is worse, not better.** `excursions.
+losers_that_were_winners` came back at **63.3%** (vs. 61% before), and median
+holding period is still short — 5–32.5s depending on regime (`MEAN_REVERTING`
+is the worst: 30 trades, 13.3% win rate, 14 max consecutive losses, the thing
+that tripped the halt). This is not a regression in the fixes themselves; it's
+that the fixes never got a chance to run. `GivebackPolicy` requires
+`giveback_min_samples` (120) closed trades before it will trust a fit, refitting
+every `giveback_refit_every` (40) closes — so a 124-trade run gets at most one
+attempt with enough samples, and the journal showed **zero** successful
+`policy_fit` events for the entire run. `ExcursionBook.fit()`'s own statistical
+guards almost certainly rejected that one attempt as underpowered (correctly —
+120 trades is thin for a 42-cell grid search), which means the whole run traded
+on the unfit *defaults* (`activation_r=1.4, keep_fraction=0.55`), not on
+anything measured from this run's own data. The hysteresis fix is real and
+tested in isolation, but is evidently not enough on its own to move the
+churn number at the regime level, in `MEAN_REVERTING` above all.
+
+Until recently this was invisible: the engine only logged a `policy_fit` event
+when the fit succeeded, so a rejected attempt and a fit that never ran looked
+identical — nothing in the journal. It now logs every attempt with its reason
+(`gmq/app/engine.py`), so this is directly checkable in future runs rather
+than inferred.
+
+**The actual implication: a 3-day simulated run cannot validate a
+sample-hungry, data-driven exit policy.** Seeing whether `GivebackPolicy` and
+the hysteresis rule actually help requires either many more days of
+accumulated trades (weeks, not days) or a much larger simulated history — not
+further tuning of the defaults, which would just be fitting this one run.
 
 The walk-forward, Monte Carlo and stress tooling is there to test whether any
 change to those actually helps or is just another curve fit.

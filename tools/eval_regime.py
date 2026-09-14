@@ -58,13 +58,16 @@ def run(steps=60000, warm=45, seed=5, syms=None, verbose=True):
         print(f"{'precision':16s}" + "".join(
             f"{(cm[i,i]/cm[:,i].sum()*100 if cm[:,i].sum() else 0):7.1f}%"
             for i in range(n)))
-        c = np.array(conf)
         print("\ncalibration:")
-        for lo, hi in [(0, .3), (.3, .5), (.5, .7), (.7, .85), (.85, 1.01)]:
-            m = (c[:, 0] >= lo) & (c[:, 0] < hi)
-            if m.sum() > 5:
-                print(f"  conf [{lo:.2f},{hi:.2f}): n={int(m.sum()):5d} "
-                      f"acc={100*c[m,1].mean():5.1f}%")
+        if not conf:
+            print("  no observations -- increase `steps` or `warm`")
+        else:
+            c = np.array(conf)
+            for lo, hi in [(0, .3), (.3, .5), (.5, .7), (.7, .85), (.85, 1.01)]:
+                m = (c[:, 0] >= lo) & (c[:, 0] < hi)
+                if m.sum() > 5:
+                    print(f"  conf [{lo:.2f},{hi:.2f}): n={int(m.sum()):5d} "
+                          f"acc={100*c[m,1].mean():5.1f}%")
     return acc, cm
 
 
